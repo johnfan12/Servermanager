@@ -1,0 +1,72 @@
+"""SQLAlchemy ORM models for users, instances, and GPU allocations."""
+
+from datetime import datetime
+
+from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Integer, String
+from sqlalchemy.orm import relationship
+
+from database import Base
+
+
+class User(Base):
+    """Application user with resource quotas."""
+
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String(64), unique=True, nullable=False, index=True)
+    password_hash = Column(String(255), nullable=False)
+    email = Column(String(255), unique=True, nullable=False, index=True)
+    quota_gpu = Column(Integer, nullable=False, default=4)
+    quota_memory_gb = Column(Integer, nullable=False, default=64)
+    quota_max_instances = Column(Integer, nullable=False, default=3)
+    is_admin = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    instances = relationship(
+        "Instance", back_populates="user", cascade="all, delete-orphan"
+    )
+
+
+class Instance(Base):
+    """Managed container instance owned by a user."""
+
+    __tablename__ = "instances"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    container_name = Column(String(128), unique=True, nullable=False, index=True)
+    container_id = Column(String(128), unique=True, nullable=True)
+    gpu_indices = Column(JSON, nullable=False, default=list)
+    memory_gb = Column(Integer, nullable=False)
+    cpu_cores = Column(Integer, nullable=False)
+    ssh_port = Column(Integer, nullable=True, unique=True)
+    ssh_password = Column(String(64), nullable=True)
+    image_name = Column(String(128), nullable=False)
+    status = Column(String(32), nullable=False, default="stopped")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    stopped_at = Column(DateTime, nullable=True)
+    expire_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", back_populates="instances")
+    gpu_allocations = relationship(
+        "GPUAllocation",
+        back_populates="instance",
+        cascade="all, delete-orphan",
+    )
+
+
+class GPUAllocation(Base):
+    """Current GPU allocation rows for running instances."""
+
+    __tablename__ = "gpu_allocations"
+
+    gpu_index = Column(Integer, primary_key=True)
+    instance_id = Column(
+        Integer, ForeignKey("instances.id", ondelete="CASCADE"), nullable=False
+    )
+    allocated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    instance = relationship("Instance", back_populates="gpu_allocations")
