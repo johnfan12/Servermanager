@@ -11,7 +11,7 @@ from typing import Any, cast
 from filelock import FileLock
 from sqlalchemy.orm import Session, sessionmaker
 
-from config import LOCK_DIR
+from config import GPU_COUNT, LOCK_DIR
 from models import GPUAllocation, Instance, User
 
 LOGGER = logging.getLogger(__name__)
@@ -81,37 +81,58 @@ class GPUManager:
 
         try:
             live_status = self._query_nvidia_smi()
-            allocations = session.query(GPUAllocation).join(Instance).all()
-            allocation_map: dict[int, GPUAllocation] = {}
+            # cluster_manager 适配：查询 gpu_allocations 表，join Instance 和 User
+            # 构建 {gpu_index: username} 的映射，只包含 running 状态的实例
+            allocations = (
+                session.query(GPUAllocation)
+                .join(Instance)
+                .join(User)
+                .filter(Instance.status == "running")
+                .all()
+            )
+            allocation_map: dict[int, str] = {}
+            live_map: dict[int, GPUStat] = {}
             for allocation in allocations:
                 allocation_obj = cast(Any, allocation)
-                allocation_map[int(allocation_obj.gpu_index)] = allocation
-
-            enriched: list[GPUStatus] = []
-            for gpu in live_status:
-                gpu_index = int(gpu["index"])
-                allocation = allocation_map.get(gpu_index)
-                allocation_obj = (
-                    cast(Any, allocation) if allocation is not None else None
-                )
-                owner = (
+                gpu_index = int(allocation_obj.gpu_index)
+                username = (
                     allocation_obj.instance.user.username
-                    if allocation_obj is not None
-                    and allocation_obj.instance is not None
+                    if allocation_obj.instance is not None
                     and allocation_obj.instance.user is not None
                     else None
                 )
-                container_name = (
-                    allocation_obj.instance.container_name
-                    if allocation_obj is not None
-                    and allocation_obj.instance is not None
-                    else None
-                )
-                state = {
-                    **gpu,
-                    "owner": owner,
-                    "container_name": container_name,
-                    "is_idle": self.is_gpu_idle(gpu) and allocation is None,
+                if username:
+                    allocation_map[gpu_index] = str(username)
+
+            # 从 nvidia-smi 获取 GPU 型号和内存信息
+            for gpu in live_status:
+                gpu_index = int(gpu["index"])
+                live_map[gpu_index] = gpu
+
+            # cluster_manager 适配：遍历 range(GPU_COUNT) 生成完整列表
+            enriched: list[GPUStatus] = []
+            for gpu_index in range(GPU_COUNT):
+                allocated_to = allocation_map.get(gpu_index)
+                is_used = allocated_to is not None
+                live_gpu = live_map.get(gpu_index, {})
+                memory_total_mb = live_gpu.get("memory_total_mb")
+                memory_used_mb = live_gpu.get("memory_used_mb")
+                state: GPUStatus = {
+                    "index": gpu_index,
+                    "status": "used" if is_used else "free",
+                    "is_idle": not is_used,
+                    "allocated_to": allocated_to,
+                    "name": live_gpu.get("name"),
+                    "gpu_model": live_gpu.get("name"),
+                    "memory_total_mb": memory_total_mb,
+                    "memory_used_mb": memory_used_mb,
+                    "memory_total_gb": (
+                        int(memory_total_mb) // 1024
+                        if isinstance(memory_total_mb, int)
+                        else None
+                    ),
+                    "utilization_gpu": live_gpu.get("utilization_gpu"),
+                    "temperature_c": live_gpu.get("temperature_c"),
                 }
                 enriched.append(state)
 

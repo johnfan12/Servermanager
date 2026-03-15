@@ -1,0 +1,39 @@
+# PyTorch 2.7 + CUDA 12.8 — 适用于 NVIDIA 50 系列 Blackwell GPU（SM 12.0）
+# 基础镜像来自 NVIDIA NGC，内含已针对 Blackwell 架构编译的 PyTorch
+# 需要宿主机 NVIDIA 驱动 >= 570.x
+# 对应 config.py 中的 "pytorch_blackwell" 键
+# 构建命令：docker build -t lab/pytorch:2.7-cuda12.8-blackwell -f docker/Dockerfile.pytorch_blackwell .
+#
+# 说明：
+#   nvcr.io/nvidia/pytorch:25.03-py3 包含：
+#     - CUDA 12.8.1
+#     - cuDNN 9.x
+#     - PyTorch 2.7.0a0（Blackwell SM 12.0 编译）
+#     - Ubuntu 24.04, Python 3.12
+#   如需更新版本，请访问：https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch
+
+FROM nvcr.io/nvidia/pytorch:25.03-py3
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    openssh-server \
+    vim \
+    git \
+    wget \
+    curl \
+    htop \
+    tmux \
+    net-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /var/run/sshd
+
+# 允许 root 通过密码登录（container_manager 会在启动后动态设置密码）
+RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config \
+    && echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+
+# NGC 镜像默认 CMD 会启动 Jupyter，此处覆盖为 sshd
+EXPOSE 22
+
+CMD ["/usr/sbin/sshd", "-D"]

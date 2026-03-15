@@ -1,0 +1,28 @@
+# PyTorch 2.1 + CUDA 11.8 + cuDNN 8 — 适用于旧版 GPU（Ampere 及以下）
+# 对应 config.py 中的 "pytorch_old" 键
+# 构建命令：docker build -t lab/pytorch:2.1-cuda11.8 -f docker/Dockerfile.pytorch_old .
+
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    openssh-server \
+    vim \
+    git \
+    wget \
+    curl \
+    htop \
+    tmux \
+    net-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /var/run/sshd
+
+# 允许 root 通过密码登录（container_manager 会在启动后动态设置密码）
+RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config \
+    && echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+
+EXPOSE 22
+
+CMD ["/usr/sbin/sshd", "-D"]

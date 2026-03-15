@@ -71,9 +71,11 @@ async def lifespan(application: FastAPI):
 
 
 app = FastAPI(title="GPU Server Manager", lifespan=lifespan)
+
+# cluster_manager 适配：添加 CORS 中间件，允许来自 cluster_manager 前端域名的跨域请求
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # 生产环境改为具体的 VPS 域名或 IP
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -124,7 +126,12 @@ class InstanceRebuildRequest(BaseModel):
 
 
 def _serialize_instance(instance: Instance) -> dict[str, Any]:
-    """Convert an instance ORM object into an API response payload."""
+    """Convert an instance ORM object into an API response payload.
+
+    cluster_manager 适配：返回字段包含
+    id, container_name, gpu_indices, memory_gb, image_name, status,
+    ssh_port, ssh_password, expire_at（无到期时间时为 null）, created_at
+    """
     instance_obj = cast(Any, instance)
     expire_seconds = None
     expire_at = instance_obj.expire_at
@@ -965,16 +972,20 @@ def admin_update_quota(
 
 @app.get("/api/admin/instances")
 def admin_list_instances(
-    admin_user: User = Depends(get_admin_user), db: Session = Depends(get_db)
+    username: str | None = None,  # cluster_manager 适配：支持按用户名过滤实例
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
 ) -> list[dict[str, Any]]:
     """Return all managed instances for administrators."""
     del admin_user
-    instances = (
-        db.query(Instance)
-        .options(joinedload(Instance.user))
-        .order_by(Instance.created_at.desc())
-        .all()
-    )
+    # cluster_manager 适配：有 username 参数时只返回该用户的实例
+    query = db.query(Instance).options(joinedload(Instance.user))
+    if username:
+        user = db.query(User).filter(User.username == username).first()
+        if not user:
+            return []
+        query = query.filter(Instance.user_id == user.id)
+    instances = query.order_by(Instance.created_at.desc()).all()
     return [_serialize_instance(instance) for instance in instances]
 
 

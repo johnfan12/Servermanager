@@ -112,7 +112,8 @@
 - 内存滑块：8G 到 maxQuota，步长8G
 - 镜像下拉框：
   - PyTorch 2.3 (CUDA 12.1)
-  - PyTorch 2.1 (CUDA 11.8)
+  - PyTorch 2.1 (CUDA 11.8)  ← pytorch_old
+  - PyTorch 2.7 Blackwell (CUDA 12.8)  ← 50 系列专用
   - TensorFlow 2.15
   - Ubuntu 22.04 Base
 - 到期时间：不限 / 24小时 / 3天 / 7天
@@ -134,14 +135,49 @@
 - 无需引入UI框架，纯CSS实现
 - 响应式布局
 
-### 6. Docker镜像准备 `docker/Dockerfile.pytorch`
+### 6. Docker镜像准备
+
+**`docker/Dockerfile.pytorch`**（PyTorch 2.3 + CUDA 12.1，适配 Ampere/Ada 架构）
 ```dockerfile
 FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
 RUN apt-get update && apt-get install -y openssh-server vim git wget curl htop tmux
 RUN mkdir /var/run/sshd
-RUN echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
+RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config
 EXPOSE 22
 CMD ["/usr/sbin/sshd", "-D"]
+```
+
+**`docker/Dockerfile.pytorch_old`**（PyTorch 2.1 + CUDA 11.8，适配旧版 GPU）
+```dockerfile
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
+RUN apt-get update && apt-get install -y openssh-server vim git wget curl htop tmux net-tools \\
+    && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /var/run/sshd
+RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config \\
+    && echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+EXPOSE 22
+CMD ["/usr/sbin/sshd", "-D"]
+```
+
+**`docker/Dockerfile.pytorch_blackwell`**（PyTorch 2.7 + CUDA 12.8，适配 50 系列 Blackwell GPU）
+```dockerfile
+# 基于 NVIDIA NGC 25.03，包含 CUDA 12.8.1 + cuDNN 9 + PyTorch 2.7（SM 12.0 编译）
+# 需宿主机 NVIDIA 驱动 >= 570
+FROM nvcr.io/nvidia/pytorch:25.03-py3
+RUN apt-get update && apt-get install -y openssh-server vim git wget curl htop tmux net-tools \\
+    && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /var/run/sshd
+RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config \\
+    && echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+EXPOSE 22
+CMD ["/usr/sbin/sshd", "-D"]
+```
+
+构建命令（在项目根目录执行）：
+```bash
+docker build -t lab/pytorch:2.3-cuda12.1           -f docker/Dockerfile.pytorch .
+docker build -t lab/pytorch:2.1-cuda11.8           -f docker/Dockerfile.pytorch_old .
+docker build -t lab/pytorch:2.7-cuda12.8-blackwell -f docker/Dockerfile.pytorch_blackwell .
 ```
 
 ### 7. 后台任务 `scheduler.py`
@@ -165,6 +201,8 @@ ADMIN_PASSWORD = "admin123"
 AVAILABLE_IMAGES = {
     "pytorch": "lab/pytorch:2.3-cuda12.1",
     "pytorch_old": "lab/pytorch:2.1-cuda11.8",
+    # Blackwell（50 系列，SM 12.0）专用，需 NVIDIA 驱动 >= 570
+    "pytorch_blackwell": "lab/pytorch:2.7-cuda12.8-blackwell",
     "tensorflow": "lab/tensorflow:2.15",
     "base": "ubuntu:22.04",
 }
