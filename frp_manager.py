@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from docker.models.containers import Container
+from filelock import FileLock
 
 from config import (
     FRP_CONFIG_DIR,
@@ -32,6 +33,10 @@ class FrpManager:
         self.enabled = FRP_ENABLED
         self.config_file = Path(FRP_CONFIG_FILE)
         self.config_dir = Path(FRP_CONFIG_DIR)
+        
+        # 确保目录存在以创建锁文件
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        self.lock = FileLock(str(self.config_dir / "frp_config.lock"))
 
     def _generate_secret_key(self, container_name: str) -> str:
         """为容器生成唯一的 secret key."""
@@ -150,27 +155,29 @@ class FrpManager:
 
     def add_container(self, container_name: str, ssh_port: int) -> bool:
         """添加单个容器的 FRP 配置."""
-        # 读取现有配置中的容器列表
-        containers = self._load_existing_containers()
-
-        # 添加或更新
-        existing = False
-        for c in containers:
-            if c.get("name") == container_name:
-                c["ssh_port"] = ssh_port
-                existing = True
-                break
-
-        if not existing:
-            containers.append({"name": container_name, "ssh_port": ssh_port})
-
-        return self.update_config(containers)
+        with self.lock:
+            # 读取现有配置中的容器列表
+            containers = self._load_existing_containers()
+    
+            # 添加或更新
+            existing = False
+            for c in containers:
+                if c.get("name") == container_name:
+                    c["ssh_port"] = ssh_port
+                    existing = True
+                    break
+    
+            if not existing:
+                containers.append({"name": container_name, "ssh_port": ssh_port})
+    
+            return self.update_config(containers)
 
     def remove_container(self, container_name: str) -> bool:
         """移除单个容器的 FRP 配置."""
-        containers = self._load_existing_containers()
-        containers = [c for c in containers if c.get("name") != container_name]
-        return self.update_config(containers)
+        with self.lock:
+            containers = self._load_existing_containers()
+            containers = [c for c in containers if c.get("name") != container_name]
+            return self.update_config(containers)
 
     def _load_existing_containers(self) -> list[dict[str, Any]]:
         """从现有配置加载容器列表."""
@@ -218,4 +225,5 @@ class FrpManager:
                         "ssh_port": int(host_port),
                     })
 
-        return self.update_config(containers)
+        with self.lock:
+            return self.update_config(containers)
