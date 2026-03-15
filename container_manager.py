@@ -27,6 +27,7 @@ from config import (
     LOCK_DIR,
     PORT_RANGE,
 )
+from frp_manager import FrpManager
 
 LOGGER = logging.getLogger(__name__)
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
@@ -41,6 +42,7 @@ class ContainerManager:
         LOCK_DIR.mkdir(parents=True, exist_ok=True)
         self._client: docker.DockerClient | None = None
         self.port_lock = FileLock(str(LOCK_DIR / "ports.lock"))
+        self.frp_manager = FrpManager()
 
     def _docker_client(self) -> docker.DockerClient:
         """Return a lazily initialized Docker client."""
@@ -334,6 +336,16 @@ class ContainerManager:
                     if container is None:
                         raise RuntimeError("Docker did not return a container handle.")
                     container.reload()
+
+                    # 更新 FRP 配置，将容器 SSH 端口穿透到 VPS
+                    try:
+                        self.frp_manager.add_container(container_name, ssh_port)
+                    except Exception as exc:
+                        LOGGER.warning(
+                            "Failed to update FRP config for %s: %s",
+                            container_name, exc
+                        )
+
                     return {
                         "container_id": str(container.id),
                         "ssh_port": ssh_port,
@@ -386,6 +398,15 @@ class ContainerManager:
         """Remove a container forcefully."""
         try:
             self._container_by_name(container_name).remove(force=True)
+
+            # 移除 FRP 配置
+            try:
+                self.frp_manager.remove_container(container_name)
+            except Exception as exc:
+                LOGGER.warning(
+                    "Failed to remove FRP config for %s: %s",
+                    container_name, exc
+                )
         except DockerException as exc:
             raise RuntimeError(
                 f"Failed to remove container {container_name}: {exc}"
@@ -421,3 +442,12 @@ class ContainerManager:
             for container in containers
             if container.name and container.name.startswith("gpu_user_")
         ]
+
+    def sync_frp_config(self) -> bool:
+        """同步所有运行中容器的 FRP 配置（用于启动时）."""
+        try:
+            containers = self.list_managed_containers()
+            return self.frp_manager.sync_with_docker(containers)
+        except Exception as exc:
+            LOGGER.error("Failed to sync FRP config: %s", exc)
+            return False

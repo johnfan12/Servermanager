@@ -64,6 +64,13 @@ async def lifespan(application: FastAPI):
     finally:
         db.close()
     scheduler_service.start()
+
+    # 启动时同步 FRP 配置
+    try:
+        container_manager.sync_frp_config()
+    except Exception as exc:
+        LOGGER.warning("Failed to sync FRP config on startup: %s", exc)
+
     try:
         yield
     finally:
@@ -1007,3 +1014,71 @@ def admin_delete_instance(
         raise HTTPException(status_code=404, detail="Instance not found.")
     _delete_instance(db, instance)
     return {"message": "Instance deleted."}
+
+
+# ---------------------------------------------------------------------------
+# FRP 相关 API — 供 VPS (Clustermanager) 使用
+# ---------------------------------------------------------------------------
+
+class FrpContainerInfo(BaseModel):
+    """容器 FRP 连接信息."""
+
+    container_name: str
+    ssh_port: int
+    secret_key: str
+
+
+@app.get("/api/frp/containers")
+def list_frp_containers(
+    admin_user: User = Depends(get_admin_user),
+) -> list[FrpContainerInfo]:
+    """返回所有容器的 FRP 连接信息（供 VPS visitor 使用）."""
+    from frp_manager import FrpManager
+
+    del admin_user
+    frp = FrpManager()
+    containers = frp._load_existing_containers()
+
+    result = []
+    for c in containers:
+        result.append(
+            FrpContainerInfo(
+                container_name=c["name"],
+                ssh_port=c["ssh_port"],
+                secret_key=frp.get_container_secret(c["name"]),
+            )
+        )
+    return result
+
+
+@app.get("/api/frp/containers/{container_name}")
+def get_frp_container_info(
+    container_name: str,
+    admin_user: User = Depends(get_admin_user),
+) -> FrpContainerInfo:
+    """返回单个容器的 FRP 连接信息."""
+    from frp_manager import FrpManager
+
+    del admin_user
+    frp = FrpManager()
+    containers = frp._load_existing_containers()
+
+    for c in containers:
+        if c["name"] == container_name:
+            return FrpContainerInfo(
+                container_name=c["name"],
+                ssh_port=c["ssh_port"],
+                secret_key=frp.get_container_secret(c["name"]),
+            )
+
+    raise HTTPException(status_code=404, detail="Container not found in FRP config.")
+
+
+@app.post("/api/frp/sync")
+def sync_frp_config(
+    admin_user: User = Depends(get_admin_user),
+) -> dict[str, Any]:
+    """手动触发 FRP 配置同步."""
+    del admin_user
+    success = container_manager.sync_frp_config()
+    return {"success": success, "message": "FRP config synced" if success else "Failed"}

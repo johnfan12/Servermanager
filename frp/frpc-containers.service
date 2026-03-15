@@ -1,0 +1,21 @@
+[Unit]
+Description=FRP Client for GPU Containers (stcp tunnels)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Restart=always
+RestartSec=5
+
+# frpc 可执行文件路径
+ExecStart=/usr/local/bin/frpc -c /etc/frp/frpc-containers.ini
+
+# 支持热重载
+ExecReload=/bin/kill -HUP $MAINPID
+
+# 确保配置文件存在（如果不存在，创建一个空的）
+ExecStartPre=/bin/sh -c 'mkdir -p /etc/frp && touch /etc/frp/frpc-containers.ini'
+
+[Install]
+WantedBy=multi-user.target

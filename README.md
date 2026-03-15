@@ -50,16 +50,26 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. 配置参数
+### 2. 配置参数（.env 文件）
 
-编辑 `config.py`，至少确认以下配置：
+复制模板文件并修改：
 
-- `SERVER_IP`: Web 页面展示的 SSH 连接 IP
-- `DATA_DIR`: 用户数据持久化目录
-- `JWT_SECRET`: 生产环境必须修改
-- `ALLOW_REGISTER`: 是否允许开放注册
-- `ADMIN_USERNAME` / `ADMIN_PASSWORD`: 首次启动自动创建管理员账号
-- `AVAILABLE_IMAGES`: 前端镜像选项与 Docker 镜像映射
+```bash
+cp .env.copy .env
+nano .env
+```
+
+至少修改以下配置：
+
+| 配置项 | 说明 | 示例 |
+|--------|------|------|
+| `SERVER_IP` | 本机 IP 地址 | `192.168.1.100` |
+| `JWT_SECRET` | JWT 密钥（生产环境必须修改） | `your-strong-secret` |
+| `ADMIN_PASSWORD` | 管理员密码 | `your-admin-password` |
+| `FRP_SERVER_ADDR` | VPS 公网 IP（启用 FRP 时需要） | `1.2.3.4` |
+| `FRP_TOKEN` | FRP 认证令牌 | `your-frp-token` |
+
+> **提示**：配置优先级：环境变量 > `.env` 文件 > `config.py` 默认值
 
 建议先创建数据目录：
 
@@ -148,6 +158,37 @@ chmod +x start.sh
 - GPU 面板只渲染当前可见 GPU
 - 前端 GPU 数量按钮会根据实际空闲数量自动置灰
 - 当开发环境未检测到可用 GPU 时，接口会返回空列表，前端显示提示信息
+
+## FRP 容器端口穿透（可选）
+
+如需让 VPS 能够访问容器 SSH 端口，启用 FRP 功能：
+
+### 1. 安装 frpc
+
+```bash
+cd frp
+sudo bash install.sh
+```
+
+### 2. 配置 .env
+
+```bash
+# 启用 FRP
+FRP_ENABLED=true
+FRP_SERVER_ADDR=your-vps-public-ip
+FRP_SERVER_PORT=7000
+FRP_TOKEN=your-frp-secret-token
+```
+
+### 3. 启动 frpc 服务
+
+```bash
+sudo systemctl enable --now frpc-containers
+```
+
+容器创建/删除时会自动更新 FRP 配置。
+
+详细说明见 [FRP_DEPLOYMENT_GUIDE.md](../FRP_DEPLOYMENT_GUIDE.md)
 
 ## 生产建议
 

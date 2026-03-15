@@ -91,7 +91,8 @@ class GPUManager:
                 .all()
             )
             allocation_map: dict[int, str] = {}
-            live_map: dict[int, GPUStat] = {}
+            gpu_model_map: dict[int, str] = {}
+            memory_total_map: dict[int, int] = {}
             for allocation in allocations:
                 allocation_obj = cast(Any, allocation)
                 gpu_index = int(allocation_obj.gpu_index)
@@ -102,37 +103,25 @@ class GPUManager:
                     else None
                 )
                 if username:
-                    allocation_map[gpu_index] = str(username)
+                    allocation_map[gpu_index] = username
 
             # 从 nvidia-smi 获取 GPU 型号和内存信息
             for gpu in live_status:
                 gpu_index = int(gpu["index"])
-                live_map[gpu_index] = gpu
+                gpu_model_map[gpu_index] = gpu["name"]
+                memory_total_map[gpu_index] = int(gpu["memory_total_mb"]) // 1024
 
             # cluster_manager 适配：遍历 range(GPU_COUNT) 生成完整列表
             enriched: list[GPUStatus] = []
             for gpu_index in range(GPU_COUNT):
                 allocated_to = allocation_map.get(gpu_index)
                 is_used = allocated_to is not None
-                live_gpu = live_map.get(gpu_index, {})
-                memory_total_mb = live_gpu.get("memory_total_mb")
-                memory_used_mb = live_gpu.get("memory_used_mb")
                 state: GPUStatus = {
                     "index": gpu_index,
                     "status": "used" if is_used else "free",
-                    "is_idle": not is_used,
                     "allocated_to": allocated_to,
-                    "name": live_gpu.get("name"),
-                    "gpu_model": live_gpu.get("name"),
-                    "memory_total_mb": memory_total_mb,
-                    "memory_used_mb": memory_used_mb,
-                    "memory_total_gb": (
-                        int(memory_total_mb) // 1024
-                        if isinstance(memory_total_mb, int)
-                        else None
-                    ),
-                    "utilization_gpu": live_gpu.get("utilization_gpu"),
-                    "temperature_c": live_gpu.get("temperature_c"),
+                    "gpu_model": gpu_model_map.get(gpu_index),
+                    "memory_total_gb": memory_total_map.get(gpu_index),
                 }
                 enriched.append(state)
 
