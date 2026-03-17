@@ -44,6 +44,7 @@ class Instance(Base):
     cpu_cores = Column(Integer, nullable=False)
     ssh_port = Column(Integer, nullable=True, unique=True)
     ssh_password = Column(String(64), nullable=True)
+    vps_access = Column(JSON, nullable=True)  # VPS 访问信息: {vps_port, vps_ip, ssh_cmd}
     image_name = Column(String(128), nullable=False)
     status = Column(String(32), nullable=False, default="stopped")
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)

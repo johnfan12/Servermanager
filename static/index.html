@@ -1020,8 +1020,8 @@
           <td>${imageLabels[instance.image_name] || instance.image_name}</td>
           <td>
             <div class="ssh-box">
-              <span class="mono">${instance.ssh_command || "-"}</span>
-              <button class="text-btn" type="button" data-action="copy-ssh" data-id="${instance.id}">复制</button>
+              <span class="mono vps-ssh" title="通过VPS跳板机访问">${instance.vps_access && instance.vps_access.ssh_cmd ? instance.vps_access.ssh_cmd : "等待 VPS SSH 隧道同步"}</span>
+              <button class="text-btn" type="button" data-action="copy-vps-ssh" data-id="${instance.id}" ${instance.vps_access && instance.vps_access.ssh_cmd ? "" : "disabled"}>复制</button>
             </div>
           </td>
           <td>
@@ -1198,9 +1198,13 @@
       const instance = state.instances.find((item) => item.id === id);
       if (!instance) return;
       try {
-        if (action === "copy-ssh") {
-          await navigator.clipboard.writeText(instance.ssh_command || "");
-          showToast("SSH 命令已复制");
+        if (action === "copy-vps-ssh") {
+          if (!instance.vps_access?.ssh_cmd) {
+            showToast("VPS SSH 隧道尚未就绪");
+            return;
+          }
+          await navigator.clipboard.writeText(instance.vps_access.ssh_cmd);
+          showToast("VPS SSH 命令已复制");
           return;
         }
         if (action === "toggle-password") {

@@ -33,7 +33,7 @@ class FrpManager:
         self.enabled = FRP_ENABLED
         self.config_file = Path(FRP_CONFIG_FILE)
         self.config_dir = Path(FRP_CONFIG_DIR)
-        
+
         # 确保目录存在以创建锁文件
         self.config_dir.mkdir(parents=True, exist_ok=True)
         self.lock = FileLock(str(self.config_dir / "frp_config.lock"))
@@ -45,10 +45,12 @@ class FrpManager:
         hash_value = hashlib.sha256(hash_input.encode()).hexdigest()[:16]
         return f"{FRP_CONTAINER_SK_PREFIX}-{container_name}-{hash_value}"
 
-    def _build_config(self, containers: list[dict[str, Any]]) -> configparser.ConfigParser:
+    def _build_config(
+        self, containers: list[dict[str, Any]]
+    ) -> configparser.ConfigParser:
         """构建 frpc 配置."""
         config = configparser.ConfigParser()
-        config.optionxform = str  # 保持大小写
+        setattr(config, "optionxform", str)  # 保持大小写
 
         # 基础配置
         config["common"] = {
@@ -100,7 +102,7 @@ class FrpManager:
             LOGGER.info(
                 "Updated frpc config with %d containers: %s",
                 len(containers),
-                [c.get("name") for c in containers]
+                [c.get("name") for c in containers],
             )
 
             # 尝试热重载
@@ -115,7 +117,19 @@ class FrpManager:
     def _reload_frpc(self) -> None:
         """热重载 frpc 配置."""
         try:
-            # 尝试 systemctl reload
+            result = subprocess.run(
+                ["systemctl", "restart", "frpc-containers"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                LOGGER.info("Restarted frpc-containers via systemctl")
+                return
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+
+        try:
             result = subprocess.run(
                 ["systemctl", "reload", "frpc-containers"],
                 capture_output=True,
@@ -123,30 +137,31 @@ class FrpManager:
                 timeout=5,
             )
             if result.returncode == 0:
-                LOGGER.debug("Reloaded frpc via systemctl")
+                LOGGER.info("Restart unavailable; reloaded frpc-containers instead")
                 return
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
 
-        # 备用：发送 HUP 信号
         try:
-            # 查找 frpc 进程
             result = subprocess.run(
                 ["pgrep", "-f", "frpc.*containers"],
                 capture_output=True,
                 text=True,
+                timeout=5,
             )
             if result.returncode == 0 and result.stdout.strip():
                 pid = result.stdout.strip().split("\n")[0]
                 subprocess.run(["kill", "-HUP", pid], check=False)
-                LOGGER.debug("Reloaded frpc via HUP signal to pid %s", pid)
+                LOGGER.info(
+                    "Systemctl unavailable; sent HUP to frpc-containers pid %s", pid
+                )
                 return
         except Exception as exc:
             LOGGER.warning("Failed to reload frpc via HUP: %s", exc)
 
         LOGGER.warning(
-            "Could not reload frpc automatically. "
-            "Please ensure 'systemctl reload frpc-containers' works or restart manually."
+            "Could not reload or restart frpc automatically. "
+            "Please ensure 'frpc-containers' can be managed via systemctl."
         )
 
     def get_container_secret(self, container_name: str) -> str:
@@ -158,7 +173,7 @@ class FrpManager:
         with self.lock:
             # 读取现有配置中的容器列表
             containers = self._load_existing_containers()
-    
+
             # 添加或更新
             existing = False
             for c in containers:
@@ -166,10 +181,10 @@ class FrpManager:
                     c["ssh_port"] = ssh_port
                     existing = True
                     break
-    
+
             if not existing:
                 containers.append({"name": container_name, "ssh_port": ssh_port})
-    
+
             return self.update_config(containers)
 
     def remove_container(self, container_name: str) -> bool:
@@ -210,7 +225,8 @@ class FrpManager:
         containers = []
 
         for container in docker_containers:
-            if not container.name.startswith("gpu_user_"):
+            container_name = container.name or ""
+            if not container_name.startswith("gpu_user_"):
                 continue
 
             # 获取 SSH 端口映射
@@ -220,10 +236,12 @@ class FrpManager:
             if ssh_bindings:
                 host_port = ssh_bindings[0].get("HostPort")
                 if host_port:
-                    containers.append({
-                        "name": container.name,
-                        "ssh_port": int(host_port),
-                    })
+                    containers.append(
+                        {
+                            "name": container_name,
+                            "ssh_port": int(host_port),
+                        }
+                    )
 
         with self.lock:
             return self.update_config(containers)

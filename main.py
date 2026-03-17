@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -25,7 +25,14 @@ from auth import (
     hash_password,
     verify_password,
 )
-from config import ALLOW_REGISTER, AVAILABLE_IMAGES, JWT_SECRET, LOG_DIR, SERVER_IP
+from config import (
+    ALLOW_REGISTER,
+    AVAILABLE_IMAGES,
+    INTERNAL_SERVICE_TOKEN,
+    JWT_SECRET,
+    LOG_DIR,
+    SERVER_IP,
+)
 from container_manager import ContainerManager
 from database import SessionLocal, get_db, init_db
 from gpu_manager import GPUManager
@@ -162,6 +169,7 @@ def _serialize_instance(instance: Instance) -> dict[str, Any]:
         "ssh_command": f"ssh -p {ssh_port} root@{SERVER_IP}"
         if ssh_port is not None
         else None,
+        "vps_access": instance_obj.vps_access,
         "image_name": instance_obj.image_name,
         "status": instance_obj.status,
         "created_at": instance_obj.created_at.isoformat(),
@@ -1020,6 +1028,7 @@ def admin_delete_instance(
 # FRP 相关 API — 供 VPS (Clustermanager) 使用
 # ---------------------------------------------------------------------------
 
+
 class FrpContainerInfo(BaseModel):
     """容器 FRP 连接信息."""
 
@@ -1028,14 +1037,22 @@ class FrpContainerInfo(BaseModel):
     secret_key: str
 
 
+def verify_internal_service_token(
+    x_internal_token: str | None = Header(default=None),
+) -> None:
+    """Validate service-to-service requests from Clustermanager."""
+    expected_token = INTERNAL_SERVICE_TOKEN
+    if x_internal_token is None or x_internal_token != expected_token:
+        raise HTTPException(status_code=403, detail="Invalid internal service token")
+
+
 @app.get("/api/frp/containers")
 def list_frp_containers(
-    admin_user: User = Depends(get_admin_user),
+    _: None = Depends(verify_internal_service_token),
 ) -> list[FrpContainerInfo]:
     """返回所有容器的 FRP 连接信息（供 VPS visitor 使用）."""
     from frp_manager import FrpManager
 
-    del admin_user
     frp = FrpManager()
     containers = frp._load_existing_containers()
 
@@ -1054,12 +1071,11 @@ def list_frp_containers(
 @app.get("/api/frp/containers/{container_name}")
 def get_frp_container_info(
     container_name: str,
-    admin_user: User = Depends(get_admin_user),
+    _: None = Depends(verify_internal_service_token),
 ) -> FrpContainerInfo:
     """返回单个容器的 FRP 连接信息."""
     from frp_manager import FrpManager
 
-    del admin_user
     frp = FrpManager()
     containers = frp._load_existing_containers()
 
@@ -1076,9 +1092,75 @@ def get_frp_container_info(
 
 @app.post("/api/frp/sync")
 def sync_frp_config(
-    admin_user: User = Depends(get_admin_user),
+    _: None = Depends(verify_internal_service_token),
 ) -> dict[str, Any]:
     """手动触发 FRP 配置同步."""
-    del admin_user
     success = container_manager.sync_frp_config()
     return {"success": success, "message": "FRP config synced" if success else "Failed"}
+
+
+class VpsAccessInfo(BaseModel):
+    """VPS 访问信息模型."""
+
+    vps_port: int
+    vps_ip: str
+    ssh_cmd: str
+
+
+@app.post("/api/instances/{container_name}/vps-access")
+def update_vps_access(
+    container_name: str,
+    vps_info: VpsAccessInfo,
+    _: None = Depends(verify_internal_service_token),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """更新实例的 VPS 访问信息（由 ClusterManager 调用）."""
+
+    instance = (
+        db.query(Instance).filter(Instance.container_name == container_name).first()
+    )
+
+    if not instance:
+        raise HTTPException(status_code=404, detail="Instance not found")
+
+    # 存储 VPS 访问信息
+    instance_obj = cast(Any, instance)
+    instance_obj.vps_access = {
+        "vps_port": vps_info.vps_port,
+        "vps_ip": vps_info.vps_ip,
+        "ssh_cmd": vps_info.ssh_cmd,
+    }
+    db.commit()
+
+    return {
+        "success": True,
+        "message": "VPS access info updated",
+        "container_name": container_name,
+        "vps_access": instance_obj.vps_access,
+    }
+
+
+@app.get("/api/instances/{container_name}/vps-access")
+def get_vps_access(
+    container_name: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """获取实例的 VPS 访问信息."""
+    instance = (
+        db.query(Instance).filter(Instance.container_name == container_name).first()
+    )
+
+    if not instance:
+        raise HTTPException(status_code=404, detail="Instance not found")
+
+    # 检查权限（管理员或实例所有者）
+    current_user_obj = cast(Any, current_user)
+    instance_obj = cast(Any, instance)
+    if not current_user_obj.is_admin and instance_obj.user_id != current_user_obj.id:
+        raise HTTPException(status_code=403, detail="Permission denied")
+
+    if not instance_obj.vps_access:
+        return {"success": False, "message": "VPS access info not available"}
+
+    return {"success": True, "vps_access": instance_obj.vps_access}

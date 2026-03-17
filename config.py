@@ -23,8 +23,13 @@ SERVER_IP = os.environ.get("SERVER_IP", "[IP_ADDRESS]")
 DATA_DIR = os.environ.get("DATA_DIR", "/data/users")
 
 # SSH 端口范围（容器映射）
-_port_range = os.environ.get("PORT_RANGE", "20000-29999").split("-")
-PORT_RANGE = (int(_port_range[0]), int(_port_range[1])) if "-" in _port_range else (20000, 29999)
+_port_range_str = os.environ.get("PORT_RANGE", "20000-29999")
+_port_range = _port_range_str.split("-")
+PORT_RANGE = (
+    (int(_port_range[0]), int(_port_range[1]))
+    if "-" in _port_range_str and len(_port_range) == 2
+    else (20000, 29999)
+)
 
 # 工作目录
 LOG_DIR = BASE_DIR / os.environ.get("LOG_DIR", "logs")
@@ -39,6 +44,11 @@ FALLBACK_DATA_DIR = str(BASE_DIR / "data" / "users")
 # 这是 SSO 的唯一前提，否则跳转后 token 验证会返回 401
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-this-secret")
 JWT_EXPIRE_HOURS = int(os.environ.get("JWT_EXPIRE_HOURS", "24"))
+
+# 服务间鉴权密钥 — 用于 Clustermanager 调用内部 FRP/VPS 回写接口
+INTERNAL_SERVICE_TOKEN = os.environ.get(
+    "INTERNAL_SERVICE_TOKEN", "change-this-internal-service-token"
+)
 
 # 管理员账号
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
@@ -58,7 +68,9 @@ GPU_COUNT = int(os.environ.get("GPU_COUNT", "1"))
 BACKUP_RETENTION_MINUTES = int(os.environ.get("BACKUP_RETENTION_MINUTES", "30"))
 
 # 孤儿容器宽限期（分钟）
-ORPHAN_CONTAINER_GRACE_MINUTES = int(os.environ.get("ORPHAN_CONTAINER_GRACE_MINUTES", "5"))
+ORPHAN_CONTAINER_GRACE_MINUTES = int(
+    os.environ.get("ORPHAN_CONTAINER_GRACE_MINUTES", "5")
+)
 
 # 默认进程限制
 DEFAULT_PIDS_LIMIT = int(os.environ.get("DEFAULT_PIDS_LIMIT", "512"))
