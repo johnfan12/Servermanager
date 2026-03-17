@@ -6,9 +6,10 @@ set -e
 FRP_VERSION="0.58.1"
 FRP_ARCH="linux_amd64"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 echo "=== Installing FRP v${FRP_VERSION} ==="
 
-# 下载并安装 frp
 cd /tmp
 wget -q "https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/frp_${FRP_VERSION}_${FRP_ARCH}.tar.gz"
 tar -xzf "frp_${FRP_VERSION}_${FRP_ARCH}.tar.gz"
@@ -20,7 +21,6 @@ rm -rf "frp_${FRP_VERSION}_${FRP_ARCH}"
 sudo mkdir -p /etc/frp
 
 # 安装 systemd 服务
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 sudo cp "${SCRIPT_DIR}/frpc-containers.service" /etc/systemd/system/
 
 # 重新加载 systemd
