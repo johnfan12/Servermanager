@@ -1140,6 +1140,30 @@
       els.registerHint.textContent = state.meta.allow_register ? "开放注册已开启，可直接创建账号。" : "当前环境关闭开放注册，请联系管理员。";
     }
 
+    async function tryTokenLoginFromQuery() {
+      const params = new URLSearchParams(window.location.search);
+      const tokenFromQuery = params.get("token");
+      if (!tokenFromQuery) return false;
+
+      const previousToken = state.token;
+      const previousUser = state.user;
+      try {
+        state.token = tokenFromQuery;
+        const user = await api("/api/me", { headers: {} });
+        state.user = user;
+        localStorage.setItem("gsm_token", state.token);
+        localStorage.setItem("gsm_user", JSON.stringify(state.user));
+        renderAuthState();
+        const cleanUrl = `${window.location.pathname}${window.location.hash || ""}`;
+        window.history.replaceState({}, document.title, cleanUrl);
+        return true;
+      } catch (error) {
+        state.token = previousToken;
+        state.user = previousUser;
+        return false;
+      }
+    }
+
     async function loadDashboard() {
       const [quota, gpus, instances] = await Promise.all([
         api("/api/quota/me"),
@@ -1408,11 +1432,12 @@
     (async function init() {
       try {
         await bootstrapMeta();
+        const queryLoginSucceeded = await tryTokenLoginFromQuery();
         renderAuthState();
         renderGpuOptions();
         renderMemoryOptions();
         renderGpus();
-        if (state.token && state.user) {
+        if (queryLoginSucceeded || (state.token && state.user)) {
           await loadDashboard();
         }
       } catch (error) {

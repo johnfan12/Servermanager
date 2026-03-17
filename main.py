@@ -458,6 +458,23 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict[str, Any
     }
 
 
+@app.get("/api/me")
+def get_me(current_user: User = Depends(get_current_user)) -> dict[str, Any]:
+    """Return current authenticated user profile for token-based bootstrap."""
+    current_user_obj = cast(Any, current_user)
+    usage = _get_running_usage(current_user)
+    return {
+        "id": current_user_obj.id,
+        "username": current_user_obj.username,
+        "email": current_user_obj.email,
+        "is_admin": current_user_obj.is_admin,
+        **usage,
+        "quota_gpu": current_user_obj.quota_gpu,
+        "quota_memory_gb": current_user_obj.quota_memory_gb,
+        "quota_max_instances": current_user_obj.quota_max_instances,
+    }
+
+
 @app.post("/api/auth/register")
 def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> dict[str, str]:
     """Create a new user account when registration is enabled."""
