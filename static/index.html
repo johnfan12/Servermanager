@@ -852,6 +852,37 @@
       showToast.timer = window.setTimeout(() => els.toast.classList.remove("show"), 2400);
     }
 
+    async function copyText(text) {
+      if (!text) return false;
+
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.setAttribute("readonly", "readonly");
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      textarea.style.pointerEvents = "none";
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+
+      let copied = false;
+      try {
+        copied = document.execCommand("copy");
+      } finally {
+        document.body.removeChild(textarea);
+      }
+
+      if (!copied) {
+        throw new Error("复制失败");
+      }
+      return true;
+    }
+
     async function api(path, options = {}) {
       const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
       if (state.token) headers.Authorization = `Bearer ${state.token}`;
@@ -1203,7 +1234,7 @@
             showToast("VPS SSH 隧道尚未就绪");
             return;
           }
-          await navigator.clipboard.writeText(instance.vps_access.ssh_cmd);
+          await copyText(instance.vps_access.ssh_cmd);
           showToast("VPS SSH 命令已复制");
           return;
         }
@@ -1213,7 +1244,7 @@
           return;
         }
         if (action === "copy-password") {
-          await navigator.clipboard.writeText(instance.ssh_password || "");
+          await copyText(instance.ssh_password || "");
           showToast("密码已复制");
           return;
         }
