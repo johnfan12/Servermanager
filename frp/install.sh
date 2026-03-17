@@ -22,6 +22,7 @@ sudo mkdir -p /etc/frp
 
 # 安装 systemd 服务
 sudo cp "${SCRIPT_DIR}/frpc-containers.service" /etc/systemd/system/
+sudo cp "${SCRIPT_DIR}/frpc-api.service" /etc/systemd/system/
 
 # 重新加载 systemd
 sudo systemctl daemon-reload
@@ -35,9 +36,12 @@ echo "   export FRP_SERVER_ADDR='your-vps-ip'"
 echo "   export FRP_SERVER_PORT=7000"
 echo "   export FRP_TOKEN='your-secret-token'"
 echo ""
-echo "2. Start the service:"
-echo "   sudo systemctl enable frpc-containers"
-echo "   sudo systemctl start frpc-containers"
+echo "2. Start the services:"
+echo "   sudo systemctl enable frpc-containers frpc-api"
+echo "   sudo systemctl start frpc-containers frpc-api"
 echo ""
-echo "3. Start Servermanager:"
-echo "   python main.py"
+echo "3. Or use start.sh to auto-generate and start the API FRP client in user space"
+echo "   (requires FRP_SERVER_ADDR / FRP_TOKEN in .env)."
+echo ""
+echo "4. Start Servermanager:"
+echo "   ./start.sh"

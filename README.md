@@ -87,6 +87,8 @@ FRP_SERVER_PORT=7000
 FRP_TOKEN=${FRP_TOKEN}
 FRP_CONFIG_DIR=/etc/frp
 FRP_CONTAINER_SK_PREFIX=gpu-container
+FRP_API_ENABLED=true
+FRP_API_REMOTE_PORT=18881
 EOF
 
 docker build -t lab/pytorch:2.3-cuda12.1 -f docker/Dockerfile.pytorch .
@@ -133,6 +135,8 @@ curl http://127.0.0.1:18881/
 
 sudo systemctl enable --now frpc-containers frpc-api
 ```
+
+如果你直接用 `./start.sh` 启动，脚本现在也会自动根据 `.env` 生成 `runtime/frpc-api.ini` 并拉起一个用户态 `frpc` 进程，把节点 API 暴露到 VPS；这样即使忘记手动启动 `frpc-api.service`，也能避免 `Clustermanager -> 127.0.0.1:18881` 连不上。
 
 验证节点已经可供 VPS 聚合：
 
@@ -204,6 +208,8 @@ chmod +x start.sh
 ```
 
 默认监听 `http://0.0.0.0:18881`。
+
+若 `.env` 中同时配置了 `FRP_ENABLED=true`、`FRP_API_ENABLED=true`、`FRP_SERVER_ADDR`、`FRP_TOKEN`，`start.sh` 会额外自动启动 API FRP client，并把日志写到 `logs/frpc-api.log`。
 
 ## 默认账号
 
