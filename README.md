@@ -45,7 +45,7 @@
 下面这组命令面向"单个 GPU 节点 + 一台 VPS 跳板机"的最小可用部署；执行完成后，节点会同时提供：
 
 - `Servermanager` Web/API：监听节点本机 `18881`
-- 容器 SSH 的 STCP server：由 `frpc-containers` 自动维护
+- 容器 SSH 的 STCP server：按实例独立 `frpc-container@<container>.service` 自动维护
 - 节点 API 的 tcp 穿透：由单独的 `frpc-api` 提供，供 `Clustermanager` 调用
 
 先在 GPU 节点设置变量：
@@ -86,6 +86,7 @@ FRP_SERVER_ADDR=${VPS_IP}
 FRP_SERVER_PORT=7000
 FRP_TOKEN=${FRP_TOKEN}
 FRP_CONFIG_DIR=/etc/frp
+FRP_CONTAINER_CONFIG_DIR=/etc/frp/containers
 FRP_CONTAINER_SK_PREFIX=gpu-container
 FRP_API_ENABLED=true
 FRP_API_REMOTE_PORT=18881
@@ -133,7 +134,7 @@ nohup ./start.sh > logs/servermanager.log 2>&1 &
 sleep 5
 curl http://127.0.0.1:18881/
 
-sudo systemctl enable --now frpc-containers frpc-api
+sudo systemctl enable --now frpc-api
 ```
 
 如果你直接用 `./start.sh` 启动，脚本现在也会自动根据 `.env` 生成 `runtime/frpc-api.ini` 并拉起一个用户态 `frpc` 进程，把节点 API 暴露到 VPS；这样即使忘记手动启动 `frpc-api.service`，也能避免 `Clustermanager -> 127.0.0.1:18881` 连不上。
@@ -211,7 +212,7 @@ chmod +x start.sh
 
 若 `.env` 中同时配置了 `FRP_ENABLED=true`、`FRP_API_ENABLED=true`、`FRP_SERVER_ADDR`、`FRP_TOKEN`，`start.sh` 会额外自动启动 API FRP client，并把日志写到 `logs/frpc-api.log`。
 
-如果你发现“新建实例后 VPS SSH 端口始终 connection closed，手动 `sudo systemctl restart frpc-containers` 后恢复”，通常是 `Servermanager` 进程没有权限重启 `frpc-containers`。建议为运行 `Servermanager` 的账号加一条最小 sudoers 权限：
+如果你发现“新建实例后 VPS SSH 端口始终 connection closed，手动 `sudo systemctl restart frpc-container@<container>.service` 后恢复”，通常是 `Servermanager` 进程没有权限管理 per-instance unit。建议为运行 `Servermanager` 的账号加一条最小 sudoers 权限：
 
 ```bash
 sudo visudo -f /etc/sudoers.d/servermanager-frpc
@@ -220,7 +221,7 @@ sudo visudo -f /etc/sudoers.d/servermanager-frpc
 写入：
 
 ```text
-<servermanager_user> ALL=(root) NOPASSWD: /bin/systemctl restart frpc-containers, /bin/systemctl reload frpc-containers
+<servermanager_user> ALL=(root) NOPASSWD: /bin/systemctl start frpc-container@*, /bin/systemctl stop frpc-container@*, /bin/systemctl restart frpc-container@*, /bin/systemctl reload frpc-container@*
 ```
 
 其中 `<servermanager_user>` 替换成实际运行 `start.sh` 的 Linux 用户。完成后执行：
@@ -229,7 +230,7 @@ sudo visudo -f /etc/sudoers.d/servermanager-frpc
 sudo systemctl daemon-reload
 ```
 
-这样 `Servermanager` 在自动更新 `/etc/frp/frpc-containers.ini` 后可以稳定触发服务重启，避免“配置文件已更新但 frpc 未生效”。
+这样 `Servermanager` 在自动更新 `/etc/frp/containers/<container>.ini` 后可以稳定触发对应实例 service，避免“某个实例配置已更新但 frpc 未生效”。
 
 ## 默认账号
 
@@ -313,12 +314,12 @@ FRP_TOKEN=your-frp-secret-token
 ### 3. 启动 frpc 服务
 
 ```bash
-sudo systemctl enable --now frpc-containers
+sudo systemctl enable --now frpc-api
 ```
 
 如果还要让 VPS 访问节点 API，请额外创建 `/etc/frp/frpc-api.ini` 和 `frpc-api.service`；完整命令见前面的 Quickstart。
 
-容器创建/删除时会自动更新 `frpc-containers.ini`，但节点 API 穿透配置不会自动生成。
+容器创建/删除时会自动维护 `/etc/frp/containers/*.ini` 和 `frpc-container@<container>.service`；节点 API 穿透配置仍需 `frpc-api`。
 
 详细说明见 [FRP_DEPLOYMENT_GUIDE.md](../FRP_DEPLOYMENT_GUIDE.md)
 

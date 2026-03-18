@@ -1,0 +1,14 @@
+[Unit]
+Description=FRP Client for GPU container %i (stcp server)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Restart=always
+RestartSec=2
+ExecStart=/usr/local/bin/frpc -c /etc/frp/containers/%i.ini
+ExecReload=/bin/kill -HUP $MAINPID
+
+[Install]
+WantedBy=multi-user.target

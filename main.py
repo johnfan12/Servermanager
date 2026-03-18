@@ -1070,8 +1070,13 @@ def list_frp_containers(
     """返回所有容器的 FRP 连接信息（供 VPS visitor 使用）."""
     from frp_manager import FrpManager
 
+    try:
+        container_manager.sync_frp_config()
+    except Exception as exc:
+        LOGGER.warning("Failed to sync FRP config before listing containers: %s", exc)
+
     frp = FrpManager()
-    containers = frp._load_existing_containers()
+    containers = frp.get_ready_containers()
 
     result = []
     for c in containers:
@@ -1093,8 +1098,13 @@ def get_frp_container_info(
     """返回单个容器的 FRP 连接信息."""
     from frp_manager import FrpManager
 
+    try:
+        container_manager.sync_frp_config()
+    except Exception as exc:
+        LOGGER.warning("Failed to sync FRP config before querying container: %s", exc)
+
     frp = FrpManager()
-    containers = frp._load_existing_containers()
+    containers = frp.get_ready_containers()
 
     for c in containers:
         if c["name"] == container_name:

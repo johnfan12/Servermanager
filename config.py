@@ -102,4 +102,7 @@ FRP_SERVER_PORT = int(os.environ.get("FRP_SERVER_PORT", "7000"))
 FRP_TOKEN = os.environ.get("FRP_TOKEN", "your-frp-secret-token")
 FRP_CONFIG_DIR = Path(os.environ.get("FRP_CONFIG_DIR", "/etc/frp"))
 FRP_CONFIG_FILE = FRP_CONFIG_DIR / "frpc-containers.ini"
+FRP_CONTAINER_CONFIG_DIR = Path(
+    os.environ.get("FRP_CONTAINER_CONFIG_DIR", str(FRP_CONFIG_DIR / "containers"))
+)
 FRP_CONTAINER_SK_PREFIX = os.environ.get("FRP_CONTAINER_SK_PREFIX", "gpu-container")
