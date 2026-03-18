@@ -116,31 +116,64 @@ class FrpManager:
 
     def _reload_frpc(self) -> None:
         """热重载 frpc 配置."""
-        try:
-            result = subprocess.run(
-                ["systemctl", "restart", "frpc-containers"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode == 0:
-                LOGGER.info("Restarted frpc-containers via systemctl")
-                return
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
+        restart_commands = [
+            ["systemctl", "restart", "frpc-containers"],
+            ["sudo", "-n", "systemctl", "restart", "frpc-containers"],
+        ]
+        for command in restart_commands:
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                continue
 
-        try:
-            result = subprocess.run(
-                ["systemctl", "reload", "frpc-containers"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
             if result.returncode == 0:
-                LOGGER.info("Restart unavailable; reloaded frpc-containers instead")
+                LOGGER.info(
+                    "Restarted frpc-containers via command: %s", " ".join(command)
+                )
                 return
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
+
+            error_text = (result.stderr or result.stdout or "").strip()
+            if error_text:
+                LOGGER.warning(
+                    "Failed to restart frpc-containers via '%s': %s",
+                    " ".join(command),
+                    error_text,
+                )
+
+        reload_commands = [
+            ["systemctl", "reload", "frpc-containers"],
+            ["sudo", "-n", "systemctl", "reload", "frpc-containers"],
+        ]
+        for command in reload_commands:
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                continue
+
+            if result.returncode == 0:
+                LOGGER.info(
+                    "Restart unavailable; reloaded frpc-containers via command: %s",
+                    " ".join(command),
+                )
+                return
+
+            error_text = (result.stderr or result.stdout or "").strip()
+            if error_text:
+                LOGGER.warning(
+                    "Failed to reload frpc-containers via '%s': %s",
+                    " ".join(command),
+                    error_text,
+                )
 
         try:
             result = subprocess.run(
@@ -151,17 +184,31 @@ class FrpManager:
             )
             if result.returncode == 0 and result.stdout.strip():
                 pid = result.stdout.strip().split("\n")[0]
-                subprocess.run(["kill", "-HUP", pid], check=False)
-                LOGGER.info(
-                    "Systemctl unavailable; sent HUP to frpc-containers pid %s", pid
+                kill_result = subprocess.run(
+                    ["kill", "-HUP", pid],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                 )
-                return
+                if kill_result.returncode == 0:
+                    LOGGER.info(
+                        "Systemctl unavailable; sent HUP to frpc-containers pid %s",
+                        pid,
+                    )
+                    return
+                error_text = (kill_result.stderr or kill_result.stdout or "").strip()
+                LOGGER.warning(
+                    "Failed to send HUP to frpc-containers pid %s: %s",
+                    pid,
+                    error_text or "unknown error",
+                )
         except Exception as exc:
             LOGGER.warning("Failed to reload frpc via HUP: %s", exc)
 
         LOGGER.warning(
             "Could not reload or restart frpc automatically. "
-            "Please ensure 'frpc-containers' can be managed via systemctl."
+            "If Servermanager is not running as root, add sudoers permission for "
+            "'systemctl restart frpc-containers'."
         )
 
     def get_container_secret(self, container_name: str) -> str:

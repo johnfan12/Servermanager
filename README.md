@@ -211,6 +211,26 @@ chmod +x start.sh
 
 若 `.env` 中同时配置了 `FRP_ENABLED=true`、`FRP_API_ENABLED=true`、`FRP_SERVER_ADDR`、`FRP_TOKEN`，`start.sh` 会额外自动启动 API FRP client，并把日志写到 `logs/frpc-api.log`。
 
+如果你发现“新建实例后 VPS SSH 端口始终 connection closed，手动 `sudo systemctl restart frpc-containers` 后恢复”，通常是 `Servermanager` 进程没有权限重启 `frpc-containers`。建议为运行 `Servermanager` 的账号加一条最小 sudoers 权限：
+
+```bash
+sudo visudo -f /etc/sudoers.d/servermanager-frpc
+```
+
+写入：
+
+```text
+<servermanager_user> ALL=(root) NOPASSWD: /bin/systemctl restart frpc-containers, /bin/systemctl reload frpc-containers
+```
+
+其中 `<servermanager_user>` 替换成实际运行 `start.sh` 的 Linux 用户。完成后执行：
+
+```bash
+sudo systemctl daemon-reload
+```
+
+这样 `Servermanager` 在自动更新 `/etc/frp/frpc-containers.ini` 后可以稳定触发服务重启，避免“配置文件已更新但 frpc 未生效”。
+
 ## 默认账号
 
 首次启动会自动创建管理员账号：
