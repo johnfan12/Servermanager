@@ -4,31 +4,29 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>GPU管理平台</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg: #0c0e14;
-      --surface: #151820;
-      --surface2: #1c2030;
-      --border: rgba(255,255,255,.06);
-      --border-hl: rgba(99,140,255,.3);
-      --text: #e8eaef;
-      --muted: #7a8299;
-      --blue: #638cff;
-      --blue-dark: #4a73e8;
-      --green: #34d399;
-      --green-bg: rgba(52,211,153,.12);
-      --red: #f87171;
-      --red-bg: rgba(248,113,113,.12);
-      --gray: #4b5563;
-      --danger: #f87171;
-      --accent-glow: rgba(99,140,255,.18);
-      --shadow: 0 8px 32px rgba(0,0,0,.35);
+      --bg: #f3f2f1;
+      --surface: #ffffff;
+      --surface2: #faf9f8;
+      --border: #edebe9;
+      --border-hl: #0078d4;
+      --text: #323130;
+      --muted: #605e5c;
+      --blue: #0078d4;
+      --blue-dark: #106ebe;
+      --green: #107c10;
+      --green-bg: #dff6dd;
+      --red: #d13438;
+      --red-bg: #fde7e9;
+      --gray: #a19f9d;
+      --danger: #d13438;
+      --accent-light: #eff6fc;
+      --accent-glow: #eff6fc;
+      --shadow: 0 1.6px 3.6px rgba(0,0,0,.13), 0 .3px .9px rgba(0,0,0,.1);
       --mono: SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
-      --transition: .22s cubic-bezier(.4,0,.2,1);
-      --radius: 12px;
+      --transition: .15s ease;
+      --radius: 4px;
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -36,7 +34,7 @@
       min-height: 100vh;
       background: var(--bg);
       color: var(--text);
-      font: 14px/1.6 'Inter', system-ui, -apple-system, sans-serif;
+      font: 14px/1.5 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
     }
 
     button, input, select, textarea { font: inherit; }
@@ -48,7 +46,7 @@
       align-items: center;
       justify-content: center;
       padding: 24px;
-      background: radial-gradient(ellipse 80% 60% at 50% 0%, rgba(99,140,255,.08), transparent), var(--bg);
+      background: var(--bg);
     }
 
     .auth-card {
@@ -58,23 +56,22 @@
       grid-template-columns: 1fr 360px;
       background: var(--surface);
       border: 1px solid var(--border);
-      border-radius: 16px;
+      border-radius: var(--radius);
       overflow: hidden;
-      box-shadow: var(--shadow), 0 0 80px rgba(99,140,255,.04);
+      box-shadow: var(--shadow);
     }
 
     .auth-side {
       padding: 40px;
-      background: linear-gradient(180deg, var(--surface2) 0%, var(--surface) 100%);
+      background: var(--surface2);
       border-right: 1px solid var(--border);
     }
 
     .auth-side h1 {
       margin: 0 0 12px;
-      font-size: 28px;
-      font-weight: 700;
-      color: #fff;
-      letter-spacing: -.02em;
+      font-size: 24px;
+      font-weight: 600;
+      color: var(--text);
     }
 
     .auth-side p {
@@ -96,7 +93,7 @@
       font-size: 13px;
       transition: border-color var(--transition);
     }
-    .auth-point:hover { border-color: rgba(255,255,255,.12); }
+    .auth-point:hover { border-color: #c8c6c4; }
 
     .auth-main {
       padding: 36px 32px;
@@ -105,30 +102,30 @@
     .tabs {
       display: inline-flex;
       margin-bottom: 20px;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      padding: 3px;
-      background: var(--surface2);
+      border-bottom: 2px solid var(--border);
+      padding: 0;
+      background: none;
     }
 
     .tab {
-      padding: 9px 18px;
+      padding: 8px 16px;
       border: none;
-      border-radius: 8px;
+      border-radius: 0;
       background: none;
       color: var(--muted);
       cursor: pointer;
       font-weight: 500;
-      font-size: 13px;
+      font-size: 14px;
       transition: all var(--transition);
+      border-bottom: 2px solid transparent;
+      margin-bottom: -2px;
     }
     .tab:hover { color: var(--text); }
 
     .tab.active {
-      color: #fff;
-      background: var(--blue);
+      color: var(--blue);
+      border-bottom-color: var(--blue);
       font-weight: 600;
-      box-shadow: none;
     }
 
     .stack { display: grid; gap: 14px; }
@@ -145,21 +142,21 @@
     .field input,
     .field select {
       width: 100%;
-      height: 40px;
-      padding: 0 14px;
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      background: var(--surface2);
+      height: 36px;
+      padding: 0 12px;
+      border: 1px solid #8a8886;
+      border-radius: 2px;
+      background: var(--surface);
       color: var(--text);
       outline: none;
       transition: border-color var(--transition), box-shadow var(--transition);
     }
-    .field input::placeholder { color: #4b5563; }
+    .field input::placeholder { color: #a19f9d; }
 
     .field input:focus,
     .field select:focus {
       border-color: var(--blue);
-      box-shadow: 0 0 0 3px var(--accent-glow);
+      box-shadow: none;
     }
 
     .primary-btn,
@@ -174,25 +171,16 @@
 
     .primary-btn {
       width: 100%;
-      height: 40px;
-      border-radius: 8px;
+      height: 36px;
+      border-radius: 2px;
       background: var(--blue);
       color: #fff;
       font-weight: 600;
-      transition: all var(--transition);
-      position: relative;
-      overflow: hidden;
+      transition: background var(--transition);
     }
-    .primary-btn::after {
-      content: '';
-      position: absolute;
-      inset: 0;
-      background: linear-gradient(rgba(255,255,255,.1), transparent);
-      pointer-events: none;
-    }
-    .primary-btn:hover { filter: brightness(1.12); transform: translateY(-1px); }
-    .primary-btn:active { transform: translateY(0); }
-    .primary-btn:disabled { background: #3b4563; color: #6b7a9e; cursor: not-allowed; filter: none; transform: none; }
+    .primary-btn:hover { background: var(--blue-dark); }
+    .primary-btn:active { background: #005a9e; }
+    .primary-btn:disabled { background: #c8c6c4; color: #fff; cursor: not-allowed; }
 
     .secondary-btn {
       height: 32px;
@@ -213,7 +201,7 @@
       color: var(--red);
       font-size: 13px;
     }
-    .feedback.success { color: var(--green); }
+    .feedback.success { color: #107c10; }
     .helper { color: var(--muted); font-size: 12px; }
 
     .app-shell {
@@ -233,14 +221,12 @@
       position: sticky;
       top: 0;
       z-index: 10;
-      backdrop-filter: blur(12px);
     }
 
     .logo {
-      font-size: 17px;
-      font-weight: 700;
-      color: #fff;
-      letter-spacing: -.01em;
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text);
     }
 
     .header-right {
@@ -284,7 +270,7 @@
       margin: 0 0 12px;
       font-size: 14px;
       font-weight: 600;
-      color: #fff;
+      color: var(--text);
     }
 
     .gpu-list {
@@ -303,7 +289,7 @@
       background: var(--surface2);
       transition: border-color var(--transition);
     }
-    .gpu-row:hover { border-color: rgba(255,255,255,.1); }
+    .gpu-row:hover { border-color: #c8c6c4; }
 
     .gpu-name {
       display: flex;
@@ -352,9 +338,9 @@
     .content-header h2,
     .panel-header h3 {
       margin: 0;
-      font-size: 16px;
+      font-size: 15px;
       font-weight: 600;
-      color: #fff;
+      color: var(--text);
     }
 
     .content-meta {
@@ -404,15 +390,15 @@
     }
 
     .badge.running {
-      color: var(--green);
-      background: var(--green-bg);
-      border: 1px solid rgba(52,211,153,.25);
+      color: #107c10;
+      background: #dff6dd;
+      border: 1px solid #9ad29a;
     }
 
     .badge.stopped,
     .badge.error {
       color: var(--muted);
-      background: rgba(255,255,255,.04);
+      background: #f3f2f1;
       border: 1px solid var(--border);
     }
 
@@ -525,9 +511,9 @@
       background: var(--surface2);
       transition: border-color var(--transition);
     }
-    .admin-item:hover { border-color: rgba(255,255,255,.1); }
+    .admin-item:hover { border-color: #c8c6c4; }
 
-    .admin-item strong { display: block; margin-bottom: 4px; color: #fff; }
+    .admin-item strong { display: block; margin-bottom: 4px; color: var(--text); }
     .admin-actions { margin-top: 8px; display: flex; gap: 12px; flex-wrap: wrap; }
 
     .modal {
@@ -536,7 +522,7 @@
       display: none;
       align-items: center;
       justify-content: center;
-      background: rgba(0, 0, 0, 0.6);
+      background: rgba(0, 0, 0, 0.4);
       backdrop-filter: blur(4px);
       padding: 24px;
       z-index: 20;
@@ -562,7 +548,7 @@
 
     .modal-card.light .modal-header {
       background: var(--surface2);
-      color: #fff;
+      color: var(--text);
       border-bottom: 1px solid var(--border);
     }
 
@@ -785,7 +771,7 @@
     <div class="modal-card">
       <div class="modal-header">
         <strong id="logTitle">容器日志</strong>
-        <button id="closeLogModal" class="secondary-btn" type="button">关闭</button>
+        <button id="closeLogModal" class="secondary-btn" type="button">✕</button>
       </div>
       <pre id="logTerminal" class="terminal"></pre>
     </div>
@@ -795,7 +781,7 @@
     <div class="modal-card light" style="width:min(420px, 100%);">
       <div class="modal-header">
         <strong id="configTitle">变更配置</strong>
-        <button id="closeConfigModal" class="secondary-btn" type="button">关闭</button>
+        <button id="closeConfigModal" class="secondary-btn" type="button">✕</button>
       </div>
       <form id="configForm" class="form-grid">
         <div class="field">
@@ -816,7 +802,7 @@
     <div class="modal-card light" style="width:min(460px, 100%);">
       <div class="modal-header">
         <strong id="deleteTitle">确认删除实例</strong>
-        <button id="closeDeleteModal" class="secondary-btn" type="button">关闭</button>
+        <button id="closeDeleteModal" class="secondary-btn" type="button">✕</button>
       </div>
       <form id="deleteForm" class="form-grid">
         <div class="danger-panel">
