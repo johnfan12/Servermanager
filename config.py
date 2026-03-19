@@ -12,6 +12,11 @@ from dotenv import load_dotenv
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
+
+def _parse_csv(raw: str) -> list[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 # ============================================================================
 # 基础服务配置
 # ============================================================================
@@ -44,6 +49,7 @@ FALLBACK_DATA_DIR = str(BASE_DIR / "data" / "users")
 # 这是 SSO 的唯一前提，否则跳转后 token 验证会返回 401
 JWT_SECRET = os.environ.get("JWT_SECRET", "change-this-secret")
 JWT_EXPIRE_HOURS = int(os.environ.get("JWT_EXPIRE_HOURS", "24"))
+ENV = os.environ.get("ENV", "dev").lower()
 
 # 服务间鉴权密钥 — 用于 Clustermanager 调用内部 FRP/VPS 回写接口
 INTERNAL_SERVICE_TOKEN = os.environ.get(
@@ -106,3 +112,39 @@ FRP_CONTAINER_CONFIG_DIR = Path(
     os.environ.get("FRP_CONTAINER_CONFIG_DIR", str(FRP_CONFIG_DIR / "containers"))
 )
 FRP_CONTAINER_SK_PREFIX = os.environ.get("FRP_CONTAINER_SK_PREFIX", "gpu-container")
+
+# CORS 配置（默认仅本地调试）
+CORS_ALLOW_ORIGINS: tuple[str, ...] = tuple(
+    _parse_csv(os.environ.get("CORS_ALLOW_ORIGINS", "http://localhost:9999"))
+)
+CORS_ALLOW_CREDENTIALS: bool = (
+    os.environ.get("CORS_ALLOW_CREDENTIALS", "true").lower() == "true"
+)
+
+
+def _ensure_secure_production_config() -> None:
+    if ENV != "prod":
+        return
+
+    invalid_values = {
+        "JWT_SECRET": {"", "change-this-secret", "change-this-to-a-strong-secret-key"},
+        "INTERNAL_SERVICE_TOKEN": {
+            "",
+            "change-this-internal-service-token",
+        },
+        "ADMIN_PASSWORD": {"", "admin123", "your-strong-admin-password"},
+        "FRP_TOKEN": {"", "your-frp-secret-token"},
+    }
+
+    bad = [
+        key
+        for key, disallowed in invalid_values.items()
+        if str(globals().get(key, "")) in disallowed
+    ]
+    if bad:
+        raise RuntimeError(
+            "Refusing to start in ENV=prod with insecure config: " + ", ".join(bad)
+        )
+
+
+_ensure_secure_production_config()

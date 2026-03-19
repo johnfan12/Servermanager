@@ -28,6 +28,9 @@ from auth import (
 from config import (
     ALLOW_REGISTER,
     AVAILABLE_IMAGES,
+    CORS_ALLOW_CREDENTIALS,
+    CORS_ALLOW_ORIGINS,
+    ENV,
     INTERNAL_SERVICE_TOKEN,
     JWT_SECRET,
     LOG_DIR,
@@ -64,6 +67,8 @@ async def lifespan(application: FastAPI):
         LOGGER.warning(
             "JWT_SECRET is using the default insecure value. Set environment variable JWT_SECRET in production."
         )
+    if ENV == "prod":
+        LOGGER.info("Running in production mode with strict config checks")
     init_db()
     db = SessionLocal()
     try:
@@ -89,11 +94,16 @@ app = FastAPI(title="GPU Server Manager", lifespan=lifespan)
 # cluster_manager 适配：添加 CORS 中间件，允许来自 cluster_manager 前端域名的跨域请求
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 生产环境改为具体的 VPS 域名或 IP
-    allow_credentials=True,
+    allow_origins=list(CORS_ALLOW_ORIGINS),
+    allow_credentials=CORS_ALLOW_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if CORS_ALLOW_CREDENTIALS and "*" in CORS_ALLOW_ORIGINS:
+    raise RuntimeError(
+        "Invalid CORS configuration: cannot use wildcard origin when credentials are enabled."
+    )
 
 container_manager = ContainerManager()
 gpu_manager = GPUManager(SessionLocal)
