@@ -40,6 +40,17 @@ chmod +x start.sh
 - `FRP_CONTAINER_CONFIG_DIR`：默认 `/etc/frp/containers`
 - `ALLOW_REGISTER`：是否开放注册
 
+### 获取节点 `admin_token`（用于 Clustermanager 的 `NODES_JSON`）
+
+```bash
+curl -s http://127.0.0.1:18881/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"<ADMIN_PASSWORD>"}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])'
+```
+
+将输出的 token 填到 `NODES_JSON.node1.admin_token`。
+
 ## 常见问题（QA）
 
 ### Q1: 创建实例后 SSH 显示端口正常，但连接 `Connection closed`
