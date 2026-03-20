@@ -131,7 +131,13 @@ class InstanceCreateRequest(BaseModel):
     num_gpus: int = Field(ge=0)
     memory_gb: int = Field(ge=8)
     image: str
-    expire_hours: int | None = Field(default=None, ge=1)
+    expire_hours: int = Field(ge=24, le=168)
+
+
+class InstanceRenewRequest(BaseModel):
+    """Request body for extending an instance expiration time."""
+
+    extend_days: int = Field(ge=1, le=7)
 
 
 class QuotaUpdateRequest(BaseModel):
@@ -255,54 +261,14 @@ def _schedule_backup_cleanup(backup_path: Path) -> None:
         loop = asyncio.get_running_loop()
         loop.create_task(_cleanup())
     except RuntimeError:
-        LOGGER.warning(
-            "No running event loop available for delayed backup cleanup: %s",
+        LOGGER.info(
+            "No running event loop for delayed cleanup; removing backup now: %s",
             backup_path,
         )
-
-
-def _clone_instance_record(
-    db: Session,
-    source_instance: Instance,
-    user: User,
-    container_name: str,
-    gpu_indices: list[int],
-    workspace_dir: Path,
-) -> Instance:
-    """Create a DB record and Docker container for a cloned instance."""
-    source_obj = cast(Any, source_instance)
-    user_obj = cast(Any, user)
-    instance = Instance(
-        user_id=user_obj.id,
-        container_name=container_name,
-        gpu_indices=gpu_indices,
-        memory_gb=int(source_obj.memory_gb),
-        cpu_cores=int(source_obj.cpu_cores),
-        image_name=str(source_obj.image_name),
-        status="error",
-        expire_at=source_obj.expire_at,
-    )
-    db.add(instance)
-    db.flush()
-
-    for gpu_index in gpu_indices:
-        db.add(GPUAllocation(gpu_index=gpu_index, instance_id=instance.id))
-
-    container_info = container_manager.create_container(
-        username=str(user_obj.username),
-        gpu_indices=gpu_indices,
-        memory_gb=int(source_obj.memory_gb),
-        cpu_cores=int(source_obj.cpu_cores),
-        image_name=str(source_obj.image_name),
-        container_name=container_name,
-        workspace_dir=workspace_dir,
-    )
-    instance_obj = cast(Any, instance)
-    instance_obj.container_id = str(container_info["container_id"])
-    instance_obj.ssh_port = int(container_info["ssh_port"])
-    instance_obj.ssh_password = str(container_info["ssh_password"])
-    instance_obj.status = "running"
-    return instance
+        try:
+            container_manager.remove_workspace(backup_path)
+        except RuntimeError as exc:
+            LOGGER.warning("Failed to remove temporary backup %s: %s", backup_path, exc)
 
 
 def _rebuild_instance_with_new_gpus(
@@ -545,6 +511,10 @@ def create_instance(
         )
     if payload.image not in AVAILABLE_IMAGES:
         raise HTTPException(status_code=400, detail="Unsupported image selection.")
+    if payload.expire_hours % 24 != 0:
+        raise HTTPException(
+            status_code=400, detail="Expiration must be in full-day increments."
+        )
 
     db.refresh(current_user)
     usage = _get_running_usage(current_user)
@@ -558,11 +528,7 @@ def create_instance(
         raise HTTPException(status_code=400, detail="Memory quota exceeded.")
 
     cpu_cores = max(4, payload.num_gpus * 8)
-    expire_at = (
-        datetime.utcnow() + timedelta(hours=payload.expire_hours)
-        if payload.expire_hours is not None
-        else None
-    )
+    expire_at = datetime.utcnow() + timedelta(hours=payload.expire_hours)
     container_name = _unique_name(f"gpu_user_{current_user_obj.username}")
     workspace_path = container_manager.get_instance_workspace_dir(
         str(current_user_obj.username), container_name
@@ -761,90 +727,38 @@ def restart_instance(
     return {"message": "Instance restarted."}
 
 
-@app.post("/api/instances/{instance_id}/clone")
-def clone_instance(
+@app.post("/api/instances/{instance_id}/renew")
+def renew_instance(
     instance_id: int,
+    payload: InstanceRenewRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Clone an instance, including its workspace data, into a new container."""
-    source_instance = _get_instance_for_user(db, instance_id, current_user)
-    source_obj = cast(Any, source_instance)
-    current_user_obj = cast(Any, current_user)
+    """Extend instance expiration time when remaining time is under 7 days."""
+    instance = _get_instance_for_user(db, instance_id, current_user)
+    instance_obj = cast(Any, instance)
+    now = datetime.utcnow()
+    expire_at = instance_obj.expire_at
+    if expire_at is None:
+        raise HTTPException(
+            status_code=400, detail="Instance does not support renewal."
+        )
 
-    db.refresh(current_user)
-    usage = _get_running_usage(current_user)
-    source_gpu_count = len(list(source_obj.gpu_indices))
-    if usage["used_instances"] + 1 > int(current_user_obj.quota_max_instances):
-        raise HTTPException(status_code=400, detail="Instance quota exceeded.")
-    if usage["used_gpu"] + source_gpu_count > int(current_user_obj.quota_gpu):
-        raise HTTPException(status_code=400, detail="GPU quota exceeded for clone.")
-    if usage["used_memory_gb"] + int(source_obj.memory_gb) > int(
-        current_user_obj.quota_memory_gb
-    ):
-        raise HTTPException(status_code=400, detail="Memory quota exceeded for clone.")
+    remaining_seconds = (expire_at - now).total_seconds()
+    if remaining_seconds > 7 * 24 * 3600:
+        raise HTTPException(
+            status_code=400,
+            detail="Renewal is only allowed when less than 7 days remain.",
+        )
 
-    clone_name = _unique_name(f"gpu_user_{current_user_obj.username}_clone")
-    source_workspace = container_manager.locate_instance_workspace_dir(
-        str(current_user_obj.username), str(source_obj.container_name)
-    )
-    clone_workspace = container_manager.get_instance_workspace_dir(
-        str(current_user_obj.username), clone_name, create=False
-    )
-
-    with gpu_manager.locked_allocation():
-        try:
-            selected_gpus: list[int] = []
-            if source_gpu_count > 0:
-                statuses = gpu_manager.get_gpu_status(db)
-                idle_gpu_indices: list[int] = []
-                for status in statuses:
-                    if status.get("is_idle") is True:
-                        gpu_index = status.get("index")
-                        if isinstance(gpu_index, int):
-                            idle_gpu_indices.append(gpu_index)
-                if len(idle_gpu_indices) < source_gpu_count:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Not enough idle GPUs are available for cloning.",
-                    )
-                selected_gpus = idle_gpu_indices[:source_gpu_count]
-                gpu_manager.allocate(
-                    current_user,
-                    selected_gpus,
-                    int(source_obj.memory_gb),
-                    int(source_obj.cpu_cores),
-                    db,
-                )
-
-            container_manager.copy_workspace(source_workspace, clone_workspace)
-            clone_instance_obj = _clone_instance_record(
-                db,
-                source_instance,
-                current_user,
-                clone_name,
-                selected_gpus,
-                clone_workspace,
-            )
-            LOGGER.info(
-                "Cloned instance %s to %s for user %s",
-                source_obj.container_name,
-                clone_name,
-                current_user_obj.username,
-            )
-            db.commit()
-            db.refresh(clone_instance_obj)
-            return _serialize_instance(clone_instance_obj)
-        except HTTPException:
-            db.rollback()
-            raise
-        except (RuntimeError, ValueError) as exc:
-            db.rollback()
-            try:
-                container_manager.remove_workspace(clone_workspace)
-            except RuntimeError:
-                pass
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+    base_time = expire_at if expire_at > now else now
+    instance_obj.expire_at = base_time + timedelta(days=payload.extend_days)
+    db.commit()
+    db.refresh(instance)
+    return {
+        "message": "Instance renewed.",
+        "instance": _serialize_instance(instance),
+    }
 
 
 @app.post("/api/instances/{instance_id}/rebuild")

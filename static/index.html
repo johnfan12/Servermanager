@@ -717,14 +717,17 @@
             <div class="field">
               <label for="expireSelect">到期时间</label>
               <select id="expireSelect">
-                <option value="">不限</option>
-                <option value="24">24h</option>
+                <option value="24">1天</option>
+                <option value="48">2天</option>
                 <option value="72">3天</option>
-                <option value="168">7天</option>
+                <option value="96">4天</option>
+                <option value="120">5天</option>
+                <option value="144">6天</option>
+                <option value="168" selected>7天</option>
               </select>
             </div>
             <button id="createButton" class="primary-btn" type="submit">创建实例</button>
-            <div class="helper" style="margin-top:8px;">选择 0 GPU 即为纯 CPU 容器。不可选的选项表示资源不足。</div>
+            <div class="helper" style="margin-top:8px;">到期时间按天选择（1-7天）。实例到期后会自动停止；临近到期可续期。</div>
           </form>
         </div>
       </aside>
@@ -817,6 +820,31 @@
     </div>
   </div>
 
+  <div id="renewModal" class="modal">
+    <div class="modal-card light" style="width:min(420px, 100%);">
+      <div class="modal-header">
+        <strong id="renewTitle">实例续期</strong>
+        <button id="closeRenewModal" class="secondary-btn" type="button">✕</button>
+      </div>
+      <form id="renewForm" class="form-grid">
+        <div class="helper">可续期 1-7 天；仅在实例剩余时间少于 7 天时可续期。</div>
+        <div class="field">
+          <label for="renewDaysSelect">续期天数</label>
+          <select id="renewDaysSelect">
+            <option value="1" selected>1天</option>
+            <option value="2">2天</option>
+            <option value="3">3天</option>
+            <option value="4">4天</option>
+            <option value="5">5天</option>
+            <option value="6">6天</option>
+            <option value="7">7天</option>
+          </select>
+        </div>
+        <button id="renewSubmitButton" class="primary-btn" type="submit">确认续期</button>
+      </form>
+    </div>
+  </div>
+
   <div id="toast" class="toast"></div>
 
   <script>
@@ -834,6 +862,8 @@
       configTargetId: null,
       deleteTargetId: null,
       deleteTargetName: "",
+      renewTargetId: null,
+      renewTargetName: "",
     };
 
     const imageLabels = {
@@ -890,6 +920,12 @@
       deleteConfirmInput: document.getElementById("deleteConfirmInput"),
       deleteSubmitButton: document.getElementById("deleteSubmitButton"),
       closeDeleteModal: document.getElementById("closeDeleteModal"),
+      renewModal: document.getElementById("renewModal"),
+      renewTitle: document.getElementById("renewTitle"),
+      renewForm: document.getElementById("renewForm"),
+      renewDaysSelect: document.getElementById("renewDaysSelect"),
+      renewSubmitButton: document.getElementById("renewSubmitButton"),
+      closeRenewModal: document.getElementById("closeRenewModal"),
       toast: document.getElementById("toast"),
     };
 
@@ -950,7 +986,7 @@
     }
 
     function formatExpire(seconds) {
-      if (seconds === null || seconds === undefined) return "不限";
+      if (seconds === null || seconds === undefined) return "未知";
       if (seconds <= 0) return "已到期";
       const days = Math.floor(seconds / 86400);
       const hours = Math.floor((seconds % 86400) / 3600);
@@ -958,6 +994,11 @@
       if (days > 0) return `${days}天 ${hours}小时`;
       if (hours > 0) return `${hours}小时 ${minutes}分钟`;
       return `${minutes}分钟`;
+    }
+
+    function canRenew(instance) {
+      if (instance.expire_seconds === null || instance.expire_seconds === undefined) return false;
+      return instance.expire_seconds <= 7 * 24 * 3600;
     }
 
     function getStatusText(instance) {
@@ -1066,6 +1107,26 @@
       els.deleteModal.classList.remove("open");
     }
 
+    function openRenewModal(instance) {
+      state.renewTargetId = instance.id;
+      state.renewTargetName = instance.container_name;
+      els.renewTitle.textContent = `实例续期 - ${instance.container_name}`;
+      els.renewDaysSelect.value = "1";
+      els.renewSubmitButton.disabled = false;
+      els.renewSubmitButton.textContent = "确认续期";
+      els.renewModal.classList.add("open");
+      setTimeout(() => els.renewDaysSelect.focus(), 0);
+    }
+
+    function closeRenewModal() {
+      state.renewTargetId = null;
+      state.renewTargetName = "";
+      els.renewDaysSelect.value = "1";
+      els.renewSubmitButton.disabled = false;
+      els.renewSubmitButton.textContent = "确认续期";
+      els.renewModal.classList.remove("open");
+    }
+
     function renderGpus() {
       if (!state.gpus.length) {
         els.gpuGrid.innerHTML = '<div class="muted">当前未检测到 GPU</div>';
@@ -1120,8 +1181,8 @@
             <div class="ops">
               <button class="text-btn" type="button" data-action="stop" data-id="${instance.id}" ${instance.status !== "running" ? "disabled" : ""}>停止</button>
               <button class="text-btn" type="button" data-action="restart" data-id="${instance.id}" ${instance.status === "running" ? "disabled" : ""}>启动</button>
+              <button class="text-btn" type="button" data-action="renew" data-id="${instance.id}" ${canRenew(instance) ? "" : "disabled"}>续期</button>
               <button class="text-btn" type="button" data-action="rebuild" data-id="${instance.id}">变更配置</button>
-              <button class="text-btn" type="button" data-action="clone" data-id="${instance.id}">克隆</button>
               <button class="danger-text-btn" type="button" data-action="delete" data-id="${instance.id}">删除</button>
             </div>
           </td>
@@ -1289,7 +1350,7 @@
           num_gpus: Number(els.gpuSelect.value),
           memory_gb: Number(els.memorySelect.value),
           image: els.imageSelect.value,
-          expire_hours: els.expireSelect.value ? Number(els.expireSelect.value) : null,
+          expire_hours: Number(els.expireSelect.value),
         };
         await api("/api/instances", { method: "POST", body: JSON.stringify(payload) });
         showToast("实例创建成功");
@@ -1341,6 +1402,10 @@
           await api(`/api/instances/${id}/restart`, { method: "POST" });
           showToast("实例已重启");
         }
+        if (action === "renew") {
+          openRenewModal(instance);
+          return;
+        }
         if (action === "rebuild") {
           openConfigModal(instance);
           return;
@@ -1348,10 +1413,6 @@
         if (action === "delete") {
           openDeleteModal(instance);
           return;
-        }
-        if (action === "clone") {
-          await api(`/api/instances/${id}/clone`, { method: "POST" });
-          showToast("实例克隆成功");
         }
         await loadDashboard();
       } catch (error) {
@@ -1443,6 +1504,32 @@
       }
     }
 
+    async function handleRenewSubmit(event) {
+      event.preventDefault();
+      if (state.renewTargetId === null) return;
+      const extendDays = Number(els.renewDaysSelect.value);
+      if (!Number.isInteger(extendDays) || extendDays < 1 || extendDays > 7) {
+        showToast("请输入 1 到 7 的整数天数");
+        return;
+      }
+
+      els.renewSubmitButton.disabled = true;
+      els.renewSubmitButton.textContent = "续期中...";
+      try {
+        await api(`/api/instances/${state.renewTargetId}/renew`, {
+          method: "POST",
+          body: JSON.stringify({ extend_days: extendDays }),
+        });
+        closeRenewModal();
+        showToast(`实例已续期 ${extendDays} 天`);
+        await loadDashboard();
+      } catch (error) {
+        showToast(error.message || "续期失败");
+        els.renewSubmitButton.disabled = false;
+        els.renewSubmitButton.textContent = "确认续期";
+      }
+    }
+
     function logout() {
       state.token = "";
       state.user = null;
@@ -1478,6 +1565,9 @@
     els.deleteForm.addEventListener("submit", handleDeleteSubmit);
     els.closeDeleteModal.addEventListener("click", closeDeleteModal);
     els.deleteModal.addEventListener("click", (event) => { if (event.target === els.deleteModal) closeDeleteModal(); });
+    els.renewForm.addEventListener("submit", handleRenewSubmit);
+    els.closeRenewModal.addEventListener("click", closeRenewModal);
+    els.renewModal.addEventListener("click", (event) => { if (event.target === els.renewModal) closeRenewModal(); });
     els.deleteConfirmInput.addEventListener("input", () => {
       els.deleteSubmitButton.disabled = els.deleteConfirmInput.value.trim() !== state.deleteTargetName;
     });

@@ -43,6 +43,27 @@ class ContainerManager:
         self._client: docker.DockerClient | None = None
         self.port_lock = FileLock(str(LOCK_DIR / "ports.lock"))
         self.frp_manager = FrpManager()
+        self._data_root = self._resolve_data_root()
+
+    def _resolve_data_root(self) -> Path:
+        """Choose a writable workspace root once at startup."""
+        primary_root = Path(DATA_DIR)
+        fallback_root = Path(FALLBACK_DATA_DIR)
+
+        try:
+            primary_root.mkdir(parents=True, exist_ok=True)
+            probe = primary_root / ".write_probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return primary_root
+        except Exception:
+            fallback_root.mkdir(parents=True, exist_ok=True)
+            LOGGER.warning(
+                "DATA_DIR %s is not writable; using fallback root %s",
+                DATA_DIR,
+                fallback_root,
+            )
+            return fallback_root
 
     def _docker_client(self) -> docker.DockerClient:
         """Return a lazily initialized Docker client."""
@@ -98,22 +119,13 @@ class ContainerManager:
     def _ensure_user_data_dir(self, username: str) -> Path:
         """Ensure the per-user data root directory exists."""
         safe_username = self._validated_username(username)
-        user_dir = self._safe_path(Path(DATA_DIR), safe_username)
+        user_dir = self._safe_path(self._data_root, safe_username)
         try:
             user_dir.mkdir(parents=True, exist_ok=True)
             return user_dir
-        except PermissionError:
-            fallback_dir = self._safe_path(Path(FALLBACK_DATA_DIR), safe_username)
-            fallback_dir.mkdir(parents=True, exist_ok=True)
-            LOGGER.warning(
-                "DATA_DIR %s is not writable; falling back to %s",
-                DATA_DIR,
-                fallback_dir.parent,
-            )
-            return fallback_dir
         except OSError as exc:
             raise RuntimeError(
-                f"Failed to prepare user workspace directory under {DATA_DIR}: {exc}"
+                f"Failed to prepare user workspace directory under {self._data_root}: {exc}"
             ) from exc
 
     def get_instance_workspace_dir(
@@ -343,7 +355,8 @@ class ContainerManager:
                     except Exception as exc:
                         LOGGER.warning(
                             "Failed to update FRP config for %s: %s",
-                            container_name, exc
+                            container_name,
+                            exc,
                         )
 
                     return {
@@ -404,8 +417,7 @@ class ContainerManager:
                 self.frp_manager.remove_container(container_name)
             except Exception as exc:
                 LOGGER.warning(
-                    "Failed to remove FRP config for %s: %s",
-                    container_name, exc
+                    "Failed to remove FRP config for %s: %s", container_name, exc
                 )
         except DockerException as exc:
             raise RuntimeError(
