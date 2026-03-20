@@ -889,6 +889,10 @@
   <div id="toast" class="toast"></div>
 
   <script>
+    const SSH_PENDING_PREPARE_MS = 30000;
+    const SSH_PENDING_POLL_MS = 3000;
+    const SSH_PENDING_MAX_MS = 180000;
+
     const state = {
       token: localStorage.getItem("gsm_token") || "",
       user: JSON.parse(localStorage.getItem("gsm_user") || "null"),
@@ -905,6 +909,9 @@
       deleteTargetName: "",
       renewTargetId: null,
       renewTargetName: "",
+      sshPendingMap: {},
+      sshPollTimer: null,
+      sshPrepareTimer: null,
     };
 
     const imageLabels = {
@@ -1065,6 +1072,108 @@
       return `${gpuIndices.length} 张 (${gpuIndices.join(", ")})`;
     }
 
+    function stopSshPolling() {
+      if (state.sshPollTimer) {
+        window.clearInterval(state.sshPollTimer);
+        state.sshPollTimer = null;
+      }
+      if (state.sshPrepareTimer) {
+        window.clearTimeout(state.sshPrepareTimer);
+        state.sshPrepareTimer = null;
+      }
+    }
+
+    function refreshSshPollingState() {
+      const now = Date.now();
+      const pendingIds = Object.keys(state.sshPendingMap);
+      let hasPrepareWindow = false;
+      let hasPollingWindow = false;
+
+      pendingIds.forEach((id) => {
+        const pending = state.sshPendingMap[id];
+        if (!pending || !pending.startedAt) {
+          delete state.sshPendingMap[id];
+          return;
+        }
+        const elapsed = now - pending.startedAt;
+        if (elapsed > SSH_PENDING_MAX_MS) {
+          delete state.sshPendingMap[id];
+          return;
+        }
+        if (elapsed < SSH_PENDING_PREPARE_MS) {
+          hasPrepareWindow = true;
+        } else {
+          hasPollingWindow = true;
+        }
+      });
+
+      if (!hasPrepareWindow && !hasPollingWindow) {
+        stopSshPolling();
+        return;
+      }
+
+      if (hasPrepareWindow && !state.sshPrepareTimer) {
+        state.sshPrepareTimer = window.setTimeout(() => {
+          state.sshPrepareTimer = null;
+          refreshSshPollingState();
+        }, SSH_PENDING_PREPARE_MS);
+      }
+
+      if (hasPollingWindow && !state.sshPollTimer) {
+        state.sshPollTimer = window.setInterval(async () => {
+          try {
+            await loadDashboard();
+          } catch (error) {
+            // Continue polling, transient errors are ignored.
+          }
+        }, SSH_PENDING_POLL_MS);
+      }
+    }
+
+    function markInstanceSshPending(instanceId) {
+      if (!Number.isFinite(instanceId)) return;
+      state.sshPendingMap[String(instanceId)] = { startedAt: Date.now() };
+      refreshSshPollingState();
+    }
+
+    function updateSshPendingState() {
+      if (!state.instances || !state.instances.length) {
+        state.sshPendingMap = {};
+        stopSshPolling();
+        return;
+      }
+
+      const existingIds = new Set(state.instances.map((item) => String(item.id)));
+      Object.keys(state.sshPendingMap).forEach((id) => {
+        if (!existingIds.has(id)) {
+          delete state.sshPendingMap[id];
+        }
+      });
+
+      state.instances.forEach((instance) => {
+        if (instance.vps_access && instance.vps_access.ssh_cmd) {
+          delete state.sshPendingMap[String(instance.id)];
+        }
+      });
+
+      refreshSshPollingState();
+    }
+
+    function getSshDisplayText(instance) {
+      if (instance.vps_access && instance.vps_access.ssh_cmd) {
+        return instance.vps_access.ssh_cmd;
+      }
+      const pending = state.sshPendingMap[String(instance.id)];
+      if (!pending) {
+        return "等待 VPS SSH 隧道同步";
+      }
+      const elapsed = Date.now() - pending.startedAt;
+      if (elapsed < SSH_PENDING_PREPARE_MS) {
+        return "SSH隧道创建中...";
+      }
+      return "等待 VPS SSH 隧道同步";
+    }
+
     function renderAuthState() {
       const signedIn = Boolean(state.token && state.user);
       els.authView.classList.toggle("hidden", signedIn);
@@ -1217,7 +1326,7 @@
           <td>${imageLabels[instance.image_name] || instance.image_name}</td>
           <td>
             <div class="ssh-box">
-              <span class="mono vps-ssh" title="通过VPS跳板机访问">${instance.vps_access && instance.vps_access.ssh_cmd ? instance.vps_access.ssh_cmd : "等待 VPS SSH 隧道同步"}</span>
+              <span class="mono vps-ssh" title="通过VPS跳板机访问">${getSshDisplayText(instance)}</span>
               <button class="text-btn" type="button" data-action="copy-vps-ssh" data-id="${instance.id}" ${instance.vps_access && instance.vps_access.ssh_cmd ? "" : "disabled"}>复制</button>
             </div>
           </td>
@@ -1339,6 +1448,7 @@
       state.quota = quota;
       state.gpus = Array.isArray(gpus) ? gpus : [];
       state.instances = Array.isArray(instances) ? instances : [];
+      updateSshPendingState();
       renderAuthState();
       renderGpuOptions();
       renderMemoryOptions();
@@ -1404,7 +1514,10 @@
           image: els.imageSelect.value,
           expire_hours: Number(els.expireSelect.value),
         };
-        await api("/api/instances", { method: "POST", body: JSON.stringify(payload) });
+        const created = await api("/api/instances", { method: "POST", body: JSON.stringify(payload) });
+        if (created && Number.isFinite(Number(created.id))) {
+          markInstanceSshPending(Number(created.id));
+        }
         showToast("实例创建成功");
         await loadDashboard();
       } catch (error) {
@@ -1583,6 +1696,8 @@
     }
 
     function logout() {
+      state.sshPendingMap = {};
+      stopSshPolling();
       state.token = "";
       state.user = null;
       state.quota = null;
