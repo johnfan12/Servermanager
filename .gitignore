@@ -95,3 +95,6 @@ logs/
 # User Data / Uploads
 /data/
 /uploads/
+
+# Runtime files
+runtime/
