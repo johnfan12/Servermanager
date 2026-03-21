@@ -84,4 +84,6 @@ trap cleanup EXIT INT TERM
 
 start_api_frp_client
 
-uvicorn main:app --host 0.0.0.0 --port "$SERVERMANAGER_PORT" --reload
+alembic upgrade head
+
+exec uvicorn main:app --host 0.0.0.0 --port "$SERVERMANAGER_PORT" --reload

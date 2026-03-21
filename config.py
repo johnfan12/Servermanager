@@ -85,7 +85,10 @@ DEFAULT_PIDS_LIMIT = int(os.environ.get("DEFAULT_PIDS_LIMIT", "512"))
 # 数据库配置
 # ============================================================================
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./servermanager.db")
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql+psycopg://server_user:server_pass@127.0.0.1:5432/server_manager",
+)
 
 # ============================================================================
 # Docker 镜像配置
