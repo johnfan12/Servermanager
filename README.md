@@ -26,6 +26,31 @@ chmod +x start.sh
 
 默认服务地址：`http://127.0.0.1:18881`
 
+### 构建即开即用 PyTorch + HuggingFace 镜像
+
+```bash
+docker build -t lab/pytorch:2.3-cuda12.1 -f docker/Dockerfile.pytorch .
+```
+
+这个镜像内置了常用深度学习与 HuggingFace 生态包（如 `transformers`、`datasets`、`huggingface_hub`、`accelerate`、`peft`、`timm` 等），创建实例后可直接使用。
+
+### 构建更全但更大的 PyTorch Full 镜像
+
+```bash
+docker build -t lab/pytorch:2.3-cuda12.1-full -f docker/Dockerfile.pytorch_full .
+```
+
+可选开启重型组件（编译时间长、体积更大）：
+
+```bash
+docker build \
+  --build-arg INSTALL_DEEPSPEED=1 \
+  --build-arg INSTALL_XFORMERS=1 \
+  --build-arg INSTALL_FLASH_ATTN=1 \
+  -t lab/pytorch:2.3-cuda12.1-full \
+  -f docker/Dockerfile.pytorch_full .
+```
+
 ## FRP 最小说明
 
 - 容器 SSH 隧道：由后端自动维护 per-instance 配置到 `/etc/frp/containers/*.ini`

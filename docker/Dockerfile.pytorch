@@ -1,8 +1,54 @@
 FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
 
-RUN apt-get update && apt-get install -y openssh-server vim git wget curl htop tmux
-RUN mkdir /var/run/sshd
-RUN echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HOME=/root/.cache/huggingface
+
+# System tools + SSH for Servermanager instance access
+RUN apt-get update && apt-get install -y \
+    openssh-server \
+    vim \
+    git \
+    wget \
+    curl \
+    htop \
+    tmux \
+    net-tools \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Common deep-learning and Hugging Face ecosystem packages
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    pip install \
+    jupyterlab \
+    ipywidgets \
+    numpy \
+    scipy \
+    pandas \
+    scikit-learn \
+    matplotlib \
+    seaborn \
+    tqdm \
+    pillow \
+    opencv-python-headless \
+    tensorboard \
+    einops \
+    safetensors \
+    sentencepiece \
+    transformers \
+    datasets \
+    huggingface_hub \
+    tokenizers \
+    accelerate \
+    peft \
+    evaluate \
+    timm
+
+RUN mkdir -p /var/run/sshd
+
+# Password auth is set by Servermanager container startup logic
+RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
 
 EXPOSE 22
 

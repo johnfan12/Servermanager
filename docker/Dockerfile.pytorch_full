@@ -1,0 +1,84 @@
+FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HOME=/root/.cache/huggingface \
+    CUDA_HOME=/usr/local/cuda
+
+# Optional heavy packages (compile/install can be slow)
+ARG INSTALL_DEEPSPEED=0
+ARG INSTALL_XFORMERS=0
+ARG INSTALL_FLASH_ATTN=0
+
+# System tools + build toolchain for CUDA extensions
+RUN apt-get update && apt-get install -y \
+    openssh-server \
+    vim \
+    git \
+    wget \
+    curl \
+    htop \
+    tmux \
+    net-tools \
+    build-essential \
+    ninja-build \
+    cmake \
+    pkg-config \
+    libopenblas-dev \
+    libaio-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Core data science + HF + training stack
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    pip install \
+    jupyterlab \
+    ipywidgets \
+    numpy \
+    scipy \
+    pandas \
+    scikit-learn \
+    matplotlib \
+    seaborn \
+    tqdm \
+    pillow \
+    opencv-python-headless \
+    tensorboard \
+    einops \
+    safetensors \
+    sentencepiece \
+    tokenizers \
+    huggingface_hub \
+    transformers \
+    datasets \
+    evaluate \
+    accelerate \
+    peft \
+    bitsandbytes \
+    trl \
+    optimum \
+    timm \
+    onnx \
+    onnxruntime-gpu \
+    wandb \
+    rich
+
+# Optional heavy packages: enable with --build-arg ...=1
+RUN if [ "$INSTALL_DEEPSPEED" = "1" ]; then \
+      DS_BUILD_OPS=1 pip install deepspeed; \
+    fi && \
+    if [ "$INSTALL_XFORMERS" = "1" ]; then \
+      pip install xformers; \
+    fi && \
+    if [ "$INSTALL_FLASH_ATTN" = "1" ]; then \
+      pip install flash-attn --no-build-isolation; \
+    fi
+
+RUN mkdir -p /var/run/sshd
+
+# Password auth is configured by Servermanager startup logic
+RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+    echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+
+EXPOSE 22
+
+CMD ["/usr/sbin/sshd", "-D"]
