@@ -186,6 +186,44 @@ class FrpManager:
                 )
         return containers
 
+    def _remove_legacy_containers(self, container_names: set[str]) -> bool:
+        """Remove container sections from legacy FRP config to prevent ghost recovery."""
+        if not container_names:
+            return True
+
+        legacy_file = Path(FRP_CONFIG_FILE)
+        if not legacy_file.exists():
+            return True
+
+        try:
+            legacy_cfg = configparser.ConfigParser()
+            legacy_cfg.read(legacy_file)
+            removed = False
+
+            for section in list(legacy_cfg.sections()):
+                if not section.startswith("container-"):
+                    continue
+                name = section.removeprefix("container-")
+                if name in container_names:
+                    legacy_cfg.remove_section(section)
+                    removed = True
+
+            if not removed:
+                return True
+
+            if not legacy_cfg.sections():
+                legacy_file.unlink(missing_ok=True)
+                return True
+
+            temp_file = legacy_file.with_suffix(".tmp")
+            with temp_file.open("w") as fh:
+                legacy_cfg.write(fh)
+            temp_file.replace(legacy_file)
+            return True
+        except Exception as exc:
+            LOGGER.warning("Failed to cleanup legacy FRP config %s: %s", legacy_file, exc)
+            return False
+
     def get_ready_containers(self) -> list[dict[str, Any]]:
         """Load containers and ensure corresponding frpc-container@ services are active."""
         containers = self._load_existing_containers()
@@ -257,6 +295,9 @@ class FrpManager:
                 LOGGER.warning(
                     "Failed to delete stale FRP config %s: %s", config_path, exc
                 )
+
+        if stale_names:
+            success = self._remove_legacy_containers(set(stale_names)) and success
 
         return success
 
