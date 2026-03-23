@@ -91,6 +91,11 @@ ORPHAN_CONTAINER_GRACE_MINUTES = int(
 # 默认进程限制
 DEFAULT_PIDS_LIMIT = int(os.environ.get("DEFAULT_PIDS_LIMIT", "512"))
 
+# 卡时计费默认额度（单位：卡时）
+GPU_HOURS_DEFAULT_QUOTA = float(os.environ.get("GPU_HOURS_DEFAULT_QUOTA", "100"))
+if GPU_HOURS_DEFAULT_QUOTA < 0:
+    GPU_HOURS_DEFAULT_QUOTA = 0.0
+
 # 节点全局可分配内存上限（GB，按 running 实例统计）
 NODE_ALLOCATABLE_MEMORY_GB = int(os.environ.get("NODE_ALLOCATABLE_MEMORY_GB", "256"))
 if NODE_ALLOCATABLE_MEMORY_GB < 8:

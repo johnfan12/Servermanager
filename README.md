@@ -13,6 +13,36 @@
 
 ## 快速启动
 
+### 新部署（推荐流程）
+
+适用于首次在新机器部署，按顺序执行：
+
+```bash
+cd Servermanager
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.copy .env
+mkdir -p logs runtime
+
+# 升级数据库到最新版本
+alembic current
+alembic upgrade head
+alembic current
+```
+
+如果系统找不到 `alembic` 命令，可替代为：
+
+```bash
+python3 -m alembic -c alembic.ini current
+python3 -m alembic -c alembic.ini upgrade head
+python3 -m alembic -c alembic.ini current
+```
+
+确认 `current` 显示最新 revision 后，再执行 `./start.sh` 启动服务。
+
 ### 1. 准备 PostgreSQL
 
 先创建数据库和账号，例如：

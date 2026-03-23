@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, ForeignKey, Integer, String
+from sqlalchemy import JSON, Boolean, Column, DateTime, Float, ForeignKey, Integer, String
 from sqlalchemy.orm import relationship
 
 from database import Base
@@ -20,11 +20,17 @@ class User(Base):
     quota_gpu = Column(Integer, nullable=False, default=4)
     quota_memory_gb = Column(Integer, nullable=False, default=64)
     quota_max_instances = Column(Integer, nullable=False, default=3)
+    gpu_hours_quota = Column(Float, nullable=False, default=100.0)
+    gpu_hours_used = Column(Float, nullable=False, default=0.0)
+    gpu_hours_frozen = Column(Float, nullable=False, default=0.0)
     is_admin = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     instances = relationship(
         "Instance", back_populates="user", cascade="all, delete-orphan"
+    )
+    gpu_hour_ledgers = relationship(
+        "GPUHourLedger", back_populates="user", cascade="all, delete-orphan"
     )
 
 
@@ -47,6 +53,7 @@ class Instance(Base):
     vps_access = Column(JSON, nullable=True)  # VPS 访问信息: {vps_port, vps_ip, ssh_cmd}
     image_name = Column(String(128), nullable=False)
     status = Column(String(32), nullable=False, default="stopped")
+    last_billing_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     stopped_at = Column(DateTime, nullable=True)
     expire_at = Column(DateTime, nullable=True)
@@ -56,6 +63,9 @@ class Instance(Base):
         "GPUAllocation",
         back_populates="instance",
         cascade="all, delete-orphan",
+    )
+    gpu_hour_ledgers = relationship(
+        "GPUHourLedger", back_populates="instance", cascade="all, delete-orphan"
     )
 
 
@@ -71,3 +81,26 @@ class GPUAllocation(Base):
     allocated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
     instance = relationship("Instance", back_populates="gpu_allocations")
+
+
+class GPUHourLedger(Base):
+    """Billing ledger rows for GPU-hour increments."""
+
+    __tablename__ = "gpu_hour_ledgers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    instance_id = Column(
+        Integer,
+        ForeignKey("instances.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    delta_gpu_hours = Column(Float, nullable=False, default=0.0)
+    reason = Column(String(64), nullable=False, default="settlement")
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="gpu_hour_ledgers")
+    instance = relationship("Instance", back_populates="gpu_hour_ledgers")

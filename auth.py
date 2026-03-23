@@ -9,7 +9,13 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 
-from config import ADMIN_PASSWORD, ADMIN_USERNAME, JWT_EXPIRE_HOURS, JWT_SECRET
+from config import (
+    ADMIN_PASSWORD,
+    ADMIN_USERNAME,
+    GPU_HOURS_DEFAULT_QUOTA,
+    JWT_EXPIRE_HOURS,
+    JWT_SECRET,
+)
 from database import get_db
 from models import User
 
@@ -78,6 +84,7 @@ def ensure_default_admin(db: Session) -> None:
             password_hash=hash_password(ADMIN_PASSWORD),
             email=f"{ADMIN_USERNAME}@local",
             is_admin=True,
+            gpu_hours_quota=GPU_HOURS_DEFAULT_QUOTA,
         )
     )
     db.commit()

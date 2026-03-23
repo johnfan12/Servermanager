@@ -30,6 +30,7 @@ from config import (
     CORS_ALLOW_CREDENTIALS,
     CORS_ALLOW_ORIGINS,
     ENV,
+    GPU_HOURS_DEFAULT_QUOTA,
     INSTANCE_MEMORY_OPTIONS_GB,
     INTERNAL_SERVICE_TOKEN,
     JWT_SECRET,
@@ -41,7 +42,7 @@ from config import (
 from container_manager import ContainerManager
 from database import SessionLocal, get_db, init_db
 from gpu_manager import GPUManager
-from models import GPUAllocation, Instance, User
+from models import GPUAllocation, GPUHourLedger, Instance, User
 from scheduler import InstanceScheduler
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -148,6 +149,7 @@ class QuotaUpdateRequest(BaseModel):
     quota_gpu: int = Field(ge=1)
     quota_memory_gb: int = Field(ge=8)
     quota_max_instances: int = Field(ge=1)
+    gpu_hours_quota: float | None = Field(default=None, ge=0)
 
 
 class InstanceRebuildRequest(BaseModel):
@@ -216,6 +218,74 @@ def _get_running_usage(user: User) -> dict[str, int]:
     }
 
 
+def _gpu_hours_remaining(user: User) -> float:
+    user_obj = cast(Any, user)
+    quota = float(user_obj.gpu_hours_quota or 0.0)
+    used = float(user_obj.gpu_hours_used or 0.0)
+    frozen = float(user_obj.gpu_hours_frozen or 0.0)
+    return quota - used - frozen
+
+
+def _ensure_gpu_hours_available(user: User, requested_gpu_count: int) -> None:
+    """Basic admission check for GPU-hour billing quota.
+
+    Current rollout policy: GPU workloads require positive remaining GPU hours.
+    """
+    if requested_gpu_count <= 0:
+        return
+    remaining = _gpu_hours_remaining(user)
+    if remaining <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Insufficient GPU-hour balance. "
+                f"remaining={remaining:.4f}, required_gpu={requested_gpu_count}."
+            ),
+        )
+
+
+def _settle_instance_gpu_hours(
+    db: Session,
+    instance: Instance,
+    reason: str,
+    now: datetime | None = None,
+) -> float:
+    """Settle elapsed GPU hours since last billing timestamp for one instance."""
+    instance_obj = cast(Any, instance)
+    last_billing_at = instance_obj.last_billing_at
+    if last_billing_at is None:
+        return 0.0
+
+    settled_at = now or datetime.utcnow()
+    elapsed_seconds = max(0.0, (settled_at - last_billing_at).total_seconds())
+    gpu_count = len(list(instance_obj.gpu_indices or []))
+
+    increment = round((gpu_count * elapsed_seconds) / 3600.0, 4)
+    instance_obj.last_billing_at = settled_at
+
+    if increment <= 0:
+        return 0.0
+
+    user_obj = cast(Any, instance_obj.user)
+    if user_obj is None:
+        user = db.query(User).filter(User.id == instance_obj.user_id).first()
+        if user is None:
+            return 0.0
+        user_obj = cast(Any, user)
+
+    user_obj.gpu_hours_used = float(user_obj.gpu_hours_used or 0.0) + increment
+    db.add(
+        GPUHourLedger(
+            user_id=int(user_obj.id),
+            instance_id=int(instance_obj.id),
+            delta_gpu_hours=increment,
+            reason=reason,
+            created_at=settled_at,
+        )
+    )
+    return increment
+
+
 def _get_node_running_memory_gb(db: Session) -> int:
     """Compute total memory usage of all running instances on this node."""
     running_instances = db.query(Instance).filter(Instance.status == "running").all()
@@ -241,6 +311,7 @@ def _get_instance_for_user(db: Session, instance_id: int, user: User) -> Instanc
 def _delete_instance(db: Session, instance: Instance) -> None:
     """Delete a container instance and clean related allocations."""
     instance_obj = cast(Any, instance)
+    _settle_instance_gpu_hours(db, instance, reason="delete")
     try:
         container_manager.remove_container(str(instance_obj.container_name))
     except RuntimeError as exc:
@@ -336,6 +407,7 @@ def _rebuild_instance_with_new_gpus(
         instance_obj.ssh_password = str(container_info["ssh_password"])
         instance_obj.status = "running"
         instance_obj.stopped_at = None
+        instance_obj.last_billing_at = datetime.utcnow()
         _schedule_backup_cleanup(backup_path)
         return instance
     except Exception as exc:
@@ -412,6 +484,7 @@ def get_meta(db: Session = Depends(get_db)) -> dict[str, Any]:
     return {
         "server_ip": SERVER_IP,
         "allow_register": ALLOW_REGISTER,
+        "gpu_hours_default_quota": GPU_HOURS_DEFAULT_QUOTA,
         "memory_options_gb": list(INSTANCE_MEMORY_OPTIONS_GB),
         "max_instance_memory_gb": MAX_INSTANCE_MEMORY_GB,
         "node_allocatable_memory_gb": NODE_ALLOCATABLE_MEMORY_GB,
@@ -471,6 +544,10 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict[str, Any
             "quota_gpu": user_obj.quota_gpu,
             "quota_memory_gb": user_obj.quota_memory_gb,
             "quota_max_instances": user_obj.quota_max_instances,
+            "gpu_hours_quota": float(user_obj.gpu_hours_quota or 0.0),
+            "gpu_hours_used": float(user_obj.gpu_hours_used or 0.0),
+            "gpu_hours_frozen": float(user_obj.gpu_hours_frozen or 0.0),
+            "gpu_hours_remaining": _gpu_hours_remaining(user),
         },
     }
 
@@ -489,6 +566,10 @@ def get_me(current_user: User = Depends(get_current_user)) -> dict[str, Any]:
         "quota_gpu": current_user_obj.quota_gpu,
         "quota_memory_gb": current_user_obj.quota_memory_gb,
         "quota_max_instances": current_user_obj.quota_max_instances,
+        "gpu_hours_quota": float(current_user_obj.gpu_hours_quota or 0.0),
+        "gpu_hours_used": float(current_user_obj.gpu_hours_used or 0.0),
+        "gpu_hours_frozen": float(current_user_obj.gpu_hours_frozen or 0.0),
+        "gpu_hours_remaining": _gpu_hours_remaining(current_user),
     }
 
 
@@ -506,6 +587,7 @@ def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> dict[st
         username=payload.username,
         password_hash=hash_password(payload.password),
         email=payload.email,
+        gpu_hours_quota=GPU_HOURS_DEFAULT_QUOTA,
     )
     db.add(user)
     try:
@@ -571,6 +653,7 @@ def create_instance(
         )
 
     db.refresh(current_user)
+    _ensure_gpu_hours_available(current_user, payload.num_gpus)
     usage = _get_running_usage(current_user)
     if usage["used_instances"] + 1 > int(current_user_obj.quota_max_instances):
         raise HTTPException(status_code=400, detail="Instance quota exceeded.")
@@ -653,6 +736,7 @@ def create_instance(
             instance_obj.ssh_port = int(container_info["ssh_port"])
             instance_obj.ssh_password = str(container_info["ssh_password"])
             instance_obj.status = "running"
+            instance_obj.last_billing_at = datetime.utcnow()
             LOGGER.info(
                 "Created instance %s for user %s",
                 instance_obj.container_name,
@@ -736,6 +820,7 @@ def stop_instance(
     instance = _get_instance_for_user(db, instance_id, current_user)
     instance_obj = cast(Any, instance)
     try:
+        _settle_instance_gpu_hours(db, instance, reason="stop")
         container_manager.stop_container(str(instance_obj.container_name))
         gpu_manager.release(str(instance_obj.container_name), db)
         instance_obj.status = "stopped"
@@ -756,6 +841,7 @@ def restart_instance(
     """Restart a stopped instance after validating its GPU reservation."""
     instance = _get_instance_for_user(db, instance_id, current_user)
     instance_obj = cast(Any, instance)
+    _ensure_gpu_hours_available(current_user, len(list(instance_obj.gpu_indices)))
     with gpu_manager.locked_allocation():
         try:
             gpu_indices = list(instance_obj.gpu_indices)
@@ -783,6 +869,7 @@ def restart_instance(
             container_manager.restart_container(str(instance_obj.container_name))
             instance_obj.status = "running"
             instance_obj.stopped_at = None
+            instance_obj.last_billing_at = datetime.utcnow()
             db.commit()
         except ValueError as exc:
             db.rollback()
@@ -866,6 +953,7 @@ def rebuild_instance(
         raise HTTPException(status_code=400, detail="Configuration is unchanged.")
 
     db.refresh(current_user)
+    _ensure_gpu_hours_available(current_user, payload.num_gpus)
     usage = _get_running_usage(current_user)
     projected_gpu_usage = usage["used_gpu"] - current_gpu_count + payload.num_gpus
     if projected_gpu_usage > int(current_user_obj.quota_gpu):
@@ -890,6 +978,7 @@ def rebuild_instance(
 
     with gpu_manager.locked_allocation():
         try:
+            _settle_instance_gpu_hours(db, instance, reason="rebuild")
             selected_gpus = _choose_rebuild_gpu_indices(db, instance, payload.num_gpus)
             rebuilt_instance = _rebuild_instance_with_new_gpus(
                 db,
@@ -960,6 +1049,10 @@ def my_quota(
         "quota_gpu": user_obj.quota_gpu,
         "quota_memory_gb": user_obj.quota_memory_gb,
         "quota_max_instances": user_obj.quota_max_instances,
+        "gpu_hours_quota": float(user_obj.gpu_hours_quota or 0.0),
+        "gpu_hours_used": float(user_obj.gpu_hours_used or 0.0),
+        "gpu_hours_frozen": float(user_obj.gpu_hours_frozen or 0.0),
+        "gpu_hours_remaining": _gpu_hours_remaining(user),
     }
 
 
@@ -990,6 +1083,10 @@ def admin_list_users(
                 "quota_gpu": user_obj.quota_gpu,
                 "quota_memory_gb": user_obj.quota_memory_gb,
                 "quota_max_instances": user_obj.quota_max_instances,
+                "gpu_hours_quota": float(user_obj.gpu_hours_quota or 0.0),
+                "gpu_hours_used": float(user_obj.gpu_hours_used or 0.0),
+                "gpu_hours_frozen": float(user_obj.gpu_hours_frozen or 0.0),
+                "gpu_hours_remaining": _gpu_hours_remaining(user),
             }
         )
     return result
@@ -1011,6 +1108,8 @@ def admin_update_quota(
     user_obj.quota_gpu = payload.quota_gpu
     user_obj.quota_memory_gb = payload.quota_memory_gb
     user_obj.quota_max_instances = payload.quota_max_instances
+    if payload.gpu_hours_quota is not None:
+        user_obj.gpu_hours_quota = payload.gpu_hours_quota
     db.commit()
     return {"message": "Quota updated."}
 
