@@ -31,9 +31,12 @@ from config import (
     CORS_ALLOW_CREDENTIALS,
     CORS_ALLOW_ORIGINS,
     ENV,
+    INSTANCE_MEMORY_OPTIONS_GB,
     INTERNAL_SERVICE_TOKEN,
     JWT_SECRET,
     LOG_DIR,
+    MAX_INSTANCE_MEMORY_GB,
+    NODE_ALLOCATABLE_MEMORY_GB,
     SERVER_IP,
 )
 from container_manager import ContainerManager
@@ -212,6 +215,15 @@ def _get_running_usage(user: User) -> dict[str, int]:
         ),
         "used_instances": len(running_instances),
     }
+
+
+def _get_node_running_memory_gb(db: Session) -> int:
+    """Compute total memory usage of all running instances on this node."""
+    running_instances = db.query(Instance).filter(Instance.status == "running").all()
+    total = 0
+    for instance in running_instances:
+        total += int(cast(Any, instance).memory_gb)
+    return total
 
 
 def _get_instance_for_user(db: Session, instance_id: int, user: User) -> Instance:
@@ -394,12 +406,19 @@ def index() -> FileResponse:
 
 
 @app.get("/api/meta")
-def get_meta() -> dict[str, Any]:
+def get_meta(db: Session = Depends(get_db)) -> dict[str, Any]:
     """Return frontend bootstrap metadata."""
+    node_memory_used_gb = _get_node_running_memory_gb(db)
+    node_memory_free_gb = max(0, NODE_ALLOCATABLE_MEMORY_GB - node_memory_used_gb)
     return {
         "server_ip": SERVER_IP,
         "available_images": AVAILABLE_IMAGES,
         "allow_register": ALLOW_REGISTER,
+        "memory_options_gb": list(INSTANCE_MEMORY_OPTIONS_GB),
+        "max_instance_memory_gb": MAX_INSTANCE_MEMORY_GB,
+        "node_allocatable_memory_gb": NODE_ALLOCATABLE_MEMORY_GB,
+        "node_memory_used_gb": node_memory_used_gb,
+        "node_memory_free_gb": node_memory_free_gb,
     }
 
 
@@ -509,6 +528,17 @@ def create_instance(
         raise HTTPException(
             status_code=400, detail="Memory must be allocated in 8 GB increments."
         )
+    if payload.memory_gb > MAX_INSTANCE_MEMORY_GB:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Memory cannot exceed {MAX_INSTANCE_MEMORY_GB} GB.",
+        )
+    if payload.memory_gb not in INSTANCE_MEMORY_OPTIONS_GB:
+        allowed = ", ".join(str(value) for value in INSTANCE_MEMORY_OPTIONS_GB)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Memory must be one of configured options: {allowed} GB.",
+        )
     if payload.image not in AVAILABLE_IMAGES:
         raise HTTPException(status_code=400, detail="Unsupported image selection.")
     if payload.expire_hours % 24 != 0:
@@ -526,6 +556,18 @@ def create_instance(
         current_user_obj.quota_memory_gb
     ):
         raise HTTPException(status_code=400, detail="Memory quota exceeded.")
+
+    node_running_memory_gb = _get_node_running_memory_gb(db)
+    projected_node_memory_gb = node_running_memory_gb + payload.memory_gb
+    if projected_node_memory_gb > NODE_ALLOCATABLE_MEMORY_GB:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Node allocatable memory exceeded. "
+                f"Used {node_running_memory_gb} GB, requested +{payload.memory_gb} GB, "
+                f"limit {NODE_ALLOCATABLE_MEMORY_GB} GB."
+            ),
+        )
 
     cpu_cores = max(4, payload.num_gpus * 8)
     expire_at = datetime.utcnow() + timedelta(hours=payload.expire_hours)
@@ -779,6 +821,17 @@ def rebuild_instance(
             status_code=400,
             detail="Memory must be allocated in 8 GB increments.",
         )
+    if payload.memory_gb > MAX_INSTANCE_MEMORY_GB:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Memory cannot exceed {MAX_INSTANCE_MEMORY_GB} GB.",
+        )
+    if payload.memory_gb not in INSTANCE_MEMORY_OPTIONS_GB:
+        allowed = ", ".join(str(value) for value in INSTANCE_MEMORY_OPTIONS_GB)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Memory must be one of configured options: {allowed} GB.",
+        )
 
     instance = _get_instance_for_user(db, instance_id, current_user)
     instance_obj = cast(Any, instance)
@@ -798,6 +851,18 @@ def rebuild_instance(
     )
     if projected_memory_usage > int(current_user_obj.quota_memory_gb):
         raise HTTPException(status_code=400, detail="Memory quota exceeded.")
+
+    node_running_memory_gb = _get_node_running_memory_gb(db)
+    projected_node_memory_gb = node_running_memory_gb - current_memory_gb + payload.memory_gb
+    if projected_node_memory_gb > NODE_ALLOCATABLE_MEMORY_GB:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Node allocatable memory exceeded after rebuild. "
+                f"Used {node_running_memory_gb} GB, projected {projected_node_memory_gb} GB, "
+                f"limit {NODE_ALLOCATABLE_MEMORY_GB} GB."
+            ),
+        )
 
     with gpu_manager.locked_allocation():
         try:

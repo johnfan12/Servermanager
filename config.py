@@ -17,6 +17,16 @@ def _parse_csv(raw: str) -> list[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _parse_int_csv(raw: str) -> list[int]:
+    values: list[int] = []
+    for item in _parse_csv(raw):
+        try:
+            values.append(int(item))
+        except ValueError:
+            continue
+    return values
+
+
 # ============================================================================
 # 基础服务配置
 # ============================================================================
@@ -80,6 +90,37 @@ ORPHAN_CONTAINER_GRACE_MINUTES = int(
 
 # 默认进程限制
 DEFAULT_PIDS_LIMIT = int(os.environ.get("DEFAULT_PIDS_LIMIT", "512"))
+
+# 节点全局可分配内存上限（GB，按 running 实例统计）
+NODE_ALLOCATABLE_MEMORY_GB = int(os.environ.get("NODE_ALLOCATABLE_MEMORY_GB", "256"))
+if NODE_ALLOCATABLE_MEMORY_GB < 8:
+    NODE_ALLOCATABLE_MEMORY_GB = 8
+
+# 实例可选内存档位（GB，逗号分隔）
+_memory_options = sorted(
+    {
+        value
+        for value in _parse_int_csv(
+            os.environ.get("INSTANCE_MEMORY_OPTIONS_GB", "8,16,32,64,128")
+        )
+        if value >= 8 and value % 8 == 0
+    }
+)
+if not _memory_options:
+    _memory_options = [8, 16, 32, 64, 128]
+
+# 单实例内存上限（GB），用于限制可选档位和接口校验
+MAX_INSTANCE_MEMORY_GB = int(
+    os.environ.get("MAX_INSTANCE_MEMORY_GB", str(max(_memory_options)))
+)
+if MAX_INSTANCE_MEMORY_GB < 8:
+    MAX_INSTANCE_MEMORY_GB = 8
+
+INSTANCE_MEMORY_OPTIONS_GB: tuple[int, ...] = tuple(
+    value for value in _memory_options if value <= MAX_INSTANCE_MEMORY_GB
+)
+if not INSTANCE_MEMORY_OPTIONS_GB:
+    INSTANCE_MEMORY_OPTIONS_GB = (8,)
 
 # ============================================================================
 # 数据库配置
