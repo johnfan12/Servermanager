@@ -132,33 +132,6 @@ DATABASE_URL = os.environ.get(
 )
 
 # ============================================================================
-# Docker 镜像配置
-# ============================================================================
-
-_available_images_raw = {
-    "pytorch": os.environ.get("IMAGE_PYTORCH", "lab/pytorch:2.3-cuda12.1"),
-    "pytorch_old": os.environ.get("IMAGE_PYTORCH_OLD", "lab/pytorch:2.1-cuda11.8"),
-    "tensorflow": os.environ.get("IMAGE_TENSORFLOW", "lab/tensorflow:2.15"),
-    "base": os.environ.get("IMAGE_BASE", "lab/base:22.04"),
-}
-
-# 过滤空值，允许通过 .env 将某些镜像键禁用（置空）
-AVAILABLE_IMAGES: dict[str, str] = {
-    key: value.strip()
-    for key, value in _available_images_raw.items()
-    if isinstance(value, str) and value.strip()
-}
-
-IMAGE_LABELS: dict[str, str] = {
-    "pytorch": os.environ.get("IMAGE_LABEL_PYTORCH", "PyTorch 2.3 (CUDA 12.1)"),
-    "pytorch_old": os.environ.get(
-        "IMAGE_LABEL_PYTORCH_OLD", "PyTorch 2.1 (CUDA 11.8)"
-    ),
-    "tensorflow": os.environ.get("IMAGE_LABEL_TENSORFLOW", "TensorFlow 2.15"),
-    "base": os.environ.get("IMAGE_LABEL_BASE", "Ubuntu 22.04 Base"),
-}
-
-# ============================================================================
 # FRP 配置 — 用于将容器 SSH 端口穿透到 VPS
 # ============================================================================
 

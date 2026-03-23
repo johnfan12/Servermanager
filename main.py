@@ -27,11 +27,9 @@ from auth import (
 )
 from config import (
     ALLOW_REGISTER,
-    AVAILABLE_IMAGES,
     CORS_ALLOW_CREDENTIALS,
     CORS_ALLOW_ORIGINS,
     ENV,
-    IMAGE_LABELS,
     INSTANCE_MEMORY_OPTIONS_GB,
     INTERNAL_SERVICE_TOKEN,
     JWT_SECRET,
@@ -413,7 +411,6 @@ def get_meta(db: Session = Depends(get_db)) -> dict[str, Any]:
     node_memory_free_gb = max(0, NODE_ALLOCATABLE_MEMORY_GB - node_memory_used_gb)
     return {
         "server_ip": SERVER_IP,
-        "available_images": AVAILABLE_IMAGES,
         "allow_register": ALLOW_REGISTER,
         "memory_options_gb": list(INSTANCE_MEMORY_OPTIONS_GB),
         "max_instance_memory_gb": MAX_INSTANCE_MEMORY_GB,
@@ -436,15 +433,10 @@ def get_images() -> dict[str, Any]:
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    configured_label_by_ref = {
-        str(image_ref): IMAGE_LABELS.get(key, key)
-        for key, image_ref in AVAILABLE_IMAGES.items()
-        if image_ref
-    }
     images = [
         {
             "key": image["image_ref"],
-            "label": configured_label_by_ref.get(image["image_ref"], image["image_ref"]),
+            "label": image["image_ref"],
             "image_ref": image["image_ref"],
         }
         for image in local_images

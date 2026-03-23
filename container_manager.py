@@ -20,7 +20,6 @@ from docker.types import DeviceRequest
 from filelock import FileLock
 
 from config import (
-    AVAILABLE_IMAGES,
     DATA_DIR,
     DEFAULT_PIDS_LIMIT,
     FALLBACK_DATA_DIR,
@@ -161,15 +160,16 @@ class ContainerManager:
 
     def _workspace_helper_image(self) -> str:
         """Return a locally available image that can perform root file operations."""
-        candidates = [
-            AVAILABLE_IMAGES.get("base"),
-            AVAILABLE_IMAGES.get("pytorch"),
-            AVAILABLE_IMAGES.get("pytorch_old"),
-            AVAILABLE_IMAGES.get("tensorflow"),
+        preferred = [
+            "lab/base:22.04",
+            "lab/pytorch:2.3-cuda12.1",
+            "lab/pytorch:2.1-cuda11.8",
+            "lab/tensorflow:2.15",
         ]
+        dynamic = [item["image_ref"] for item in self.list_local_images()]
+        candidates = list(dict.fromkeys(preferred + dynamic))
+
         for image_ref in candidates:
-            if not image_ref:
-                continue
             try:
                 self._docker_client().images.get(image_ref)
                 return image_ref
@@ -181,7 +181,7 @@ class ContainerManager:
                 ) from exc
         raise RuntimeError(
             "No local helper image is available for workspace file operations. "
-            "Build `lab/base:22.04` first."
+            "Build or pull at least one image with /bin/sh and coreutils first."
         )
 
     def _run_workspace_helper(self, host_mount_dir: Path, shell_command: str) -> None:
@@ -285,46 +285,33 @@ class ContainerManager:
                 f"Failed to inspect container {container_name}: {exc}"
             ) from exc
 
-    def _resolve_image_ref(self, image_selector: str) -> str:
-        """Resolve image selector to a concrete Docker image reference.
-
-        Accepts both legacy image key (e.g. pytorch) and direct image ref (repo:tag).
-        """
-        selector = image_selector.strip()
-        if not selector:
+    def _ensure_image_available(self, image_ref: str) -> str:
+        """Ensure the selected Docker image reference exists locally."""
+        normalized = image_ref.strip()
+        if not normalized:
             raise RuntimeError("Image selection cannot be empty.")
-        if selector in AVAILABLE_IMAGES:
-            resolved = str(AVAILABLE_IMAGES[selector]).strip()
-            if not resolved:
-                raise RuntimeError(f"Configured image key '{selector}' is empty.")
-            return resolved
-        return selector
-
-    def _ensure_image_available(self, image_selector: str) -> str:
-        """Ensure the selected image exists locally before container creation."""
-        image_ref = self._resolve_image_ref(image_selector)
         try:
-            self._docker_client().images.get(image_ref)
-            return image_ref
+            self._docker_client().images.get(normalized)
+            return normalized
         except ImageNotFound as exc:
-            if image_ref == "lab/pytorch:2.3-cuda12.1":
+            if normalized == "lab/pytorch:2.3-cuda12.1":
                 raise RuntimeError(
                     "Docker image 'lab/pytorch:2.3-cuda12.1' was not found locally. "
                     "Build it first with: docker build -t lab/pytorch:2.3-cuda12.1 "
                     "-f docker/Dockerfile.pytorch docker"
                 ) from exc
             raise RuntimeError(
-                f"Docker image '{image_ref}' was not found locally. "
+                f"Docker image '{normalized}' was not found locally. "
                 "Please build or retag this image first."
             ) from exc
         except DockerException as exc:
             raise RuntimeError(
-                f"Failed to inspect Docker image {image_ref}: {exc}"
+                f"Failed to inspect Docker image {normalized}: {exc}"
             ) from exc
 
-    def ensure_image_available(self, image_selector: str) -> str:
-        """Public wrapper for validating and resolving image selection."""
-        return self._ensure_image_available(image_selector)
+    def ensure_image_available(self, image_ref: str) -> str:
+        """Public wrapper for validating Docker image selection."""
+        return self._ensure_image_available(image_ref)
 
     def create_container(
         self,
