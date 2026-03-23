@@ -31,6 +31,7 @@ from config import (
     CORS_ALLOW_CREDENTIALS,
     CORS_ALLOW_ORIGINS,
     ENV,
+    IMAGE_LABELS,
     INSTANCE_MEMORY_OPTIONS_GB,
     INTERNAL_SERVICE_TOKEN,
     JWT_SECRET,
@@ -422,6 +423,35 @@ def get_meta(db: Session = Depends(get_db)) -> dict[str, Any]:
     }
 
 
+@app.get("/api/images")
+def get_images() -> dict[str, Any]:
+    """Return image options for create/rebuild UI.
+
+    key: 前端提交到创建接口的镜像键
+    label: 展示名称
+    image_ref: 节点实际 Docker 镜像引用
+    """
+    try:
+        local_images = container_manager.list_local_images()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    configured_label_by_ref = {
+        str(image_ref): IMAGE_LABELS.get(key, key)
+        for key, image_ref in AVAILABLE_IMAGES.items()
+        if image_ref
+    }
+    images = [
+        {
+            "key": image["image_ref"],
+            "label": configured_label_by_ref.get(image["image_ref"], image["image_ref"]),
+            "image_ref": image["image_ref"],
+        }
+        for image in local_images
+    ]
+    return {"images": images}
+
+
 @app.post("/api/auth/login")
 def login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
     """Authenticate a user and return a JWT token."""
@@ -539,8 +569,10 @@ def create_instance(
             status_code=400,
             detail=f"Memory must be one of configured options: {allowed} GB.",
         )
-    if payload.image not in AVAILABLE_IMAGES:
-        raise HTTPException(status_code=400, detail="Unsupported image selection.")
+    try:
+        resolved_image_ref = container_manager.ensure_image_available(payload.image)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if payload.expire_hours % 24 != 0:
         raise HTTPException(
             status_code=400, detail="Expiration must be in full-day increments."
@@ -604,7 +636,7 @@ def create_instance(
                 gpu_indices=selected_gpus,
                 memory_gb=payload.memory_gb,
                 cpu_cores=cpu_cores,
-                image_name=payload.image,
+                image_name=resolved_image_ref,
                 status="error",
                 expire_at=expire_at,
             )
@@ -619,7 +651,7 @@ def create_instance(
                 gpu_indices=selected_gpus,
                 memory_gb=payload.memory_gb,
                 cpu_cores=cpu_cores,
-                image_name=payload.image,
+                image_name=resolved_image_ref,
                 container_name=container_name,
                 workspace_dir=workspace_path,
             )
