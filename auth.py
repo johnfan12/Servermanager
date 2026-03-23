@@ -12,7 +12,6 @@ from sqlalchemy.orm import Session
 from config import (
     ADMIN_PASSWORD,
     ADMIN_USERNAME,
-    GPU_HOURS_DEFAULT_QUOTA,
     JWT_EXPIRE_HOURS,
     JWT_SECRET,
 )
@@ -84,7 +83,6 @@ def ensure_default_admin(db: Session) -> None:
             password_hash=hash_password(ADMIN_PASSWORD),
             email=f"{ADMIN_USERNAME}@local",
             is_admin=True,
-            gpu_hours_quota=GPU_HOURS_DEFAULT_QUOTA,
         )
     )
     db.commit()
