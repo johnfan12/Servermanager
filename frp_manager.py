@@ -13,6 +13,10 @@ from docker.models.containers import Container
 from filelock import FileLock
 
 from config import (
+    FRP_API_CONFIG_FILE,
+    FRP_API_ENABLED,
+    FRP_API_LOCAL_PORT,
+    FRP_API_REMOTE_PORT,
     FRP_CONFIG_FILE,
     FRP_CONFIG_DIR,
     FRP_CONTAINER_CONFIG_DIR,
@@ -47,6 +51,9 @@ class FrpManager:
 
     def _instance_service_name(self, container_name: str) -> str:
         return f"frpc-container@{container_name}.service"
+
+    def _api_config_path(self) -> Path:
+        return Path(FRP_API_CONFIG_FILE)
 
     def _run_systemctl(self, action: str, service_name: str, timeout: int = 10) -> bool:
         commands = [
@@ -120,6 +127,31 @@ class FrpManager:
         }
         return config
 
+    def _build_api_config(self) -> configparser.ConfigParser:
+        config = configparser.ConfigParser()
+        setattr(config, "optionxform", str)
+        config["common"] = {
+            "server_addr": FRP_SERVER_ADDR,
+            "server_port": str(FRP_SERVER_PORT),
+            "token": FRP_TOKEN,
+        }
+        config["servermanager-api"] = {
+            "type": "tcp",
+            "local_ip": "127.0.0.1",
+            "local_port": str(FRP_API_LOCAL_PORT),
+            "remote_port": str(FRP_API_REMOTE_PORT),
+        }
+        return config
+
+    def _render_config(self, config: configparser.ConfigParser) -> str:
+        lines: list[str] = []
+        for section in config.sections():
+            lines.append(f"[{section}]")
+            for key, value in config.items(section):
+                lines.append(f"{key} = {value}")
+            lines.append("")
+        return "\n".join(lines).strip() + "\n"
+
     def _write_instance_config(
         self,
         container_name: str,
@@ -127,14 +159,7 @@ class FrpManager:
     ) -> bool:
         config_path = self._instance_config_path(container_name)
         config = self._build_instance_config(container_name, ssh_port)
-
-        lines: list[str] = []
-        for section in config.sections():
-            lines.append(f"[{section}]")
-            for key, value in config.items(section):
-                lines.append(f"{key} = {value}")
-            lines.append("")
-        rendered = "\n".join(lines).strip() + "\n"
+        rendered = self._render_config(config)
 
         existing = ""
         if config_path.exists():
@@ -145,6 +170,35 @@ class FrpManager:
         temp_file = config_path.with_suffix(".tmp")
         temp_file.write_text(rendered)
         temp_file.replace(config_path)
+        return True
+
+    def sync_api_client_config(self) -> bool:
+        """Keep /etc/frp/frpc-api.ini aligned with .env-driven settings."""
+        if not self.enabled or not FRP_API_ENABLED:
+            LOGGER.info("FRP API client is disabled; skip API config sync")
+            return True
+
+        config_path = self._api_config_path()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        rendered = self._render_config(self._build_api_config())
+        existing = config_path.read_text() if config_path.exists() else ""
+        if existing == rendered:
+            LOGGER.info("FRP API config already up to date: %s", config_path)
+            return True
+
+        temp_file = config_path.with_suffix(".tmp")
+        temp_file.write_text(rendered)
+        temp_file.replace(config_path)
+        LOGGER.info("Synced FRP API config from environment: %s", config_path)
+
+        service_name = "frpc-api.service"
+        if self._is_service_active(service_name):
+            if not self._run_systemctl("restart", service_name):
+                LOGGER.warning(
+                    "FRP API config changed, but failed to restart %s",
+                    service_name,
+                )
+                return False
         return True
 
     def _load_existing_containers(self) -> list[dict[str, Any]]:

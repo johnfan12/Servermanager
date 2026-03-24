@@ -81,6 +81,11 @@ async def lifespan(application: FastAPI):
 
     # 启动时同步 FRP 配置
     try:
+        container_manager.frp_manager.sync_api_client_config()
+    except Exception as exc:
+        LOGGER.warning("Failed to sync FRP API config on startup: %s", exc)
+
+    try:
         container_manager.sync_frp_config()
     except Exception as exc:
         LOGGER.warning("Failed to sync FRP config on startup: %s", exc)

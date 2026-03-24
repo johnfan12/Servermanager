@@ -33,6 +33,7 @@ def _parse_int_csv(raw: str) -> list[int]:
 
 # 服务器 IP 地址（用于显示和连接）
 SERVER_IP = os.environ.get("SERVER_IP", "[IP_ADDRESS]")
+SERVERMANAGER_PORT = int(os.environ.get("SERVERMANAGER_PORT", "18881"))
 
 # 用户数据目录
 DATA_DIR = os.environ.get("DATA_DIR", "/data/users")
@@ -146,6 +147,14 @@ FRP_SERVER_PORT = int(os.environ.get("FRP_SERVER_PORT", "7000"))
 FRP_TOKEN = os.environ.get("FRP_TOKEN", "your-frp-secret-token")
 FRP_CONFIG_DIR = Path(os.environ.get("FRP_CONFIG_DIR", "/etc/frp"))
 FRP_CONFIG_FILE = FRP_CONFIG_DIR / "frpc-containers.ini"
+FRP_API_ENABLED = os.environ.get("FRP_API_ENABLED", "true").lower() == "true"
+FRP_API_REMOTE_PORT = int(os.environ.get("FRP_API_REMOTE_PORT", "18881"))
+FRP_API_LOCAL_PORT = int(
+    os.environ.get("FRP_API_LOCAL_PORT", str(SERVERMANAGER_PORT))
+)
+FRP_API_CONFIG_FILE = Path(
+    os.environ.get("FRP_API_CONFIG_FILE", str(FRP_CONFIG_DIR / "frpc-api.ini"))
+)
 FRP_CONTAINER_CONFIG_DIR = Path(
     os.environ.get("FRP_CONTAINER_CONFIG_DIR", str(FRP_CONFIG_DIR / "containers"))
 )
