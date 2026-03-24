@@ -246,10 +246,19 @@ def _get_instance_for_user(db: Session, instance_id: int, user: User) -> Instanc
 def _delete_instance(db: Session, instance: Instance) -> None:
     """Delete a container instance and clean related allocations."""
     instance_obj = cast(Any, instance)
+    cleanup_workspace = container_manager.locate_instance_workspace_cleanup_dir(
+        str(instance_obj.user.username), str(instance_obj.container_name)
+    )
     try:
         container_manager.remove_container(str(instance_obj.container_name))
     except RuntimeError as exc:
         if "not found" not in str(exc).lower():
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    if cleanup_workspace is not None:
+        try:
+            container_manager.remove_workspace(cleanup_workspace)
+        except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     gpu_manager.release(str(instance_obj.container_name), db)

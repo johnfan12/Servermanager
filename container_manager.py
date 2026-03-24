@@ -158,6 +158,32 @@ class ContainerManager:
             f"Workspace for instance {container_name} was not found for user {username}."
         )
 
+    def locate_instance_workspace_cleanup_dir(
+        self, username: str, container_name: str
+    ) -> Path | None:
+        """Return a dedicated instance workspace that can be safely removed."""
+        safe_username = self._validated_username(username)
+        safe_container_name = self._validated_segment(container_name, "Container name")
+        roots = [
+            self._safe_path(Path(DATA_DIR), safe_username),
+            self._safe_path(Path(FALLBACK_DATA_DIR), safe_username),
+        ]
+        shared_root_found = False
+        for root in roots:
+            dedicated_dir = self._safe_path(root, safe_container_name)
+            if dedicated_dir.exists():
+                return dedicated_dir
+            if root.exists():
+                shared_root_found = True
+        if shared_root_found:
+            LOGGER.warning(
+                "Instance %s for user %s appears to use a legacy shared workspace; "
+                "skipping automatic workspace deletion.",
+                container_name,
+                username,
+            )
+        return None
+
     def _workspace_helper_image(self) -> str:
         """Return a locally available image that can perform root file operations."""
         preferred = [
