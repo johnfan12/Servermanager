@@ -757,6 +757,10 @@
               <select id="imageSelect"></select>
             </div>
             <div class="field">
+              <label for="displayNameInput">实例名</label>
+              <input id="displayNameInput" maxlength="64" placeholder="可选，留空则自动生成系统名">
+            </div>
+            <div class="field">
               <label for="expireSelect">到期时间</label>
               <select id="expireSelect">
                 <option value="24">1天</option>
@@ -939,6 +943,7 @@
       gpuSelect: document.getElementById("gpuSelect"),
       memorySelect: document.getElementById("memorySelect"),
       imageSelect: document.getElementById("imageSelect"),
+      displayNameInput: document.getElementById("displayNameInput"),
       expireSelect: document.getElementById("expireSelect"),
       createForm: document.getElementById("createForm"),
       createButton: document.getElementById("createButton"),
@@ -992,6 +997,15 @@
     function setFeedback(target, message, success = false) {
       target.textContent = message || "";
       target.classList.toggle("success", Boolean(success));
+    }
+
+    function escHtml(value) {
+      return String(value == null ? "" : value)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
     }
 
     function showToast(message) {
@@ -1071,6 +1085,21 @@
       const gpuIndices = instance.gpu_indices || [];
       if (!gpuIndices.length) return "0 张";
       return `${gpuIndices.length} 张 (${gpuIndices.join(", ")})`;
+    }
+
+    function getInstanceLabel(instance) {
+      return instance.display_name || instance.container_name || "-";
+    }
+
+    function renderInstanceName(instance) {
+      const label = getInstanceLabel(instance);
+      if (instance.display_name && instance.display_name !== instance.container_name) {
+        return `
+          <div>${escHtml(label)}</div>
+          <div class="muted mono">${escHtml(instance.container_name || "")}</div>
+        `;
+      }
+      return escHtml(label);
     }
 
     function stopSshPolling() {
@@ -1239,7 +1268,7 @@
         const disabled = value > remainingMemory;
         return `<option value="${value}" ${value === currentMemory ? "selected" : ""} ${disabled ? "disabled" : ""}>${value}</option>`;
       }).join("");
-      els.configTitle.textContent = `变更配置 - ${instance.container_name}`;
+      els.configTitle.textContent = `变更配置 - ${getInstanceLabel(instance)}`;
       els.configGpuSelect.innerHTML = gpuOptions;
       els.configMemorySelect.innerHTML = memoryOptions;
       els.configModal.classList.add("open");
@@ -1252,9 +1281,9 @@
 
     function openDeleteModal(instance) {
       state.deleteTargetId = instance.id;
-      state.deleteTargetName = instance.container_name;
-      els.deleteTitle.textContent = `确认删除 - ${instance.container_name}`;
-      els.deleteInstanceName.textContent = instance.container_name;
+      state.deleteTargetName = getInstanceLabel(instance);
+      els.deleteTitle.textContent = `确认删除 - ${getInstanceLabel(instance)}`;
+      els.deleteInstanceName.textContent = getInstanceLabel(instance);
       els.deleteConfirmInput.value = "";
       els.deleteSubmitButton.disabled = true;
       els.deleteModal.classList.add("open");
@@ -1271,8 +1300,8 @@
 
     function openRenewModal(instance) {
       state.renewTargetId = instance.id;
-      state.renewTargetName = instance.container_name;
-      els.renewTitle.textContent = `实例续期 - ${instance.container_name}`;
+      state.renewTargetName = getInstanceLabel(instance);
+      els.renewTitle.textContent = `实例续期 - ${getInstanceLabel(instance)}`;
       els.renewDaysSelect.value = "1";
       els.renewSubmitButton.disabled = false;
       els.renewSubmitButton.textContent = "确认续期";
@@ -1319,7 +1348,7 @@
       const rows = state.instances.map((instance) => `
         <tr>
           <td>
-            <button class="instance-link" type="button" data-action="logs" data-id="${instance.id}">${instance.container_name}</button>
+            <button class="instance-link" type="button" data-action="logs" data-id="${instance.id}">${renderInstanceName(instance)}</button>
           </td>
           <td><span class="badge ${instance.status === "running" ? "running" : "stopped"}">${getStatusText(instance)}</span></td>
           <td>${formatGpuDisplay(instance)}</td>
@@ -1393,7 +1422,8 @@
 
       els.adminInstances.innerHTML = state.adminInstances.length ? state.adminInstances.map((instance) => `
         <div class="admin-item">
-          <strong>${instance.container_name}</strong>
+          <strong>${escHtml(getInstanceLabel(instance))}</strong>
+          ${instance.display_name && instance.display_name !== instance.container_name ? `<div class="muted mono">${escHtml(instance.container_name)}</div>` : ""}
           <div class="muted">${instance.username || "-"} · ${formatGpuDisplay(instance)} · ${getStatusText(instance)}</div>
           <div class="admin-actions">
             <button class="danger-text-btn" type="button" data-admin-action="force-delete" data-instance-id="${instance.id}">强制删除</button>
@@ -1510,6 +1540,7 @@
       els.createButton.textContent = "创建中...";
       try {
         const payload = {
+          display_name: els.displayNameInput.value.trim() || undefined,
           num_gpus: Number(els.gpuSelect.value),
           memory_gb: Number(els.memorySelect.value),
           image: els.imageSelect.value,
@@ -1520,6 +1551,7 @@
           markInstanceSshPending(Number(created.id));
         }
         showToast("实例创建成功");
+        els.displayNameInput.value = "";
         await loadDashboard();
       } catch (error) {
         showToast(error.message || "实例创建失败");
@@ -1554,7 +1586,7 @@
         }
         if (action === "logs") {
           const data = await api(`/api/instances/${id}/logs`);
-          els.logTitle.textContent = `日志 - ${instance.container_name}`;
+          els.logTitle.textContent = `日志 - ${getInstanceLabel(instance)}`;
           els.logTerminal.textContent = data.logs || "暂无日志输出";
           els.logModal.classList.add("open");
           requestAnimationFrame(() => { els.logTerminal.scrollTop = els.logTerminal.scrollHeight; });

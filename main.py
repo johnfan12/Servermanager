@@ -54,11 +54,29 @@ logging.basicConfig(
     ],
 )
 LOGGER = logging.getLogger(__name__)
+DISPLAY_NAME_MAX_LENGTH = 64
 
 
 def _unique_name(prefix: str) -> str:
     """Return a collision-resistant resource name."""
     return f"{prefix}_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{secrets.token_hex(3)}"
+
+
+def _normalize_display_name(value: str | None) -> str | None:
+    """Normalize an optional user-facing instance name."""
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if len(normalized) > DISPLAY_NAME_MAX_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Instance name cannot exceed {DISPLAY_NAME_MAX_LENGTH} characters.",
+        )
+    if any(ord(char) < 32 for char in normalized):
+        raise HTTPException(status_code=400, detail="Instance name contains control characters.")
+    return normalized
 
 
 @asynccontextmanager
@@ -139,6 +157,7 @@ class InstanceCreateRequest(BaseModel):
     memory_gb: int = Field(ge=8)
     image: str
     expire_hours: int = Field(ge=24, le=168)
+    display_name: str | None = Field(default=None, max_length=128)
 
 
 class InstanceRenewRequest(BaseModel):
@@ -183,6 +202,7 @@ def _serialize_instance(instance: Instance) -> dict[str, Any]:
         if instance_obj.user is not None
         else None,
         "container_name": instance_obj.container_name,
+        "display_name": instance_obj.display_name,
         "container_id": instance_obj.container_id,
         "gpu_indices": instance_obj.gpu_indices,
         "memory_gb": instance_obj.memory_gb,
@@ -583,6 +603,7 @@ def create_instance(
         raise HTTPException(
             status_code=400, detail="Expiration must be in full-day increments."
         )
+    normalized_display_name = _normalize_display_name(payload.display_name)
 
     db.refresh(current_user)
     usage = _get_running_usage(current_user)
@@ -610,6 +631,17 @@ def create_instance(
     cpu_cores = max(4, payload.num_gpus * 8)
     expire_at = datetime.utcnow() + timedelta(hours=payload.expire_hours)
     container_name = _unique_name(f"gpu_user_{current_user_obj.username}")
+    display_name = normalized_display_name or container_name
+    existing_instance = (
+        db.query(Instance)
+        .filter(
+            Instance.user_id == current_user.id,
+            Instance.display_name == display_name,
+        )
+        .first()
+    )
+    if existing_instance is not None:
+        raise HTTPException(status_code=400, detail="Instance name is already in use.")
     workspace_path = container_manager.get_instance_workspace_dir(
         str(current_user_obj.username), container_name
     )
@@ -639,6 +671,7 @@ def create_instance(
             instance = Instance(
                 user_id=current_user.id,
                 container_name=container_name,
+                display_name=display_name,
                 gpu_indices=selected_gpus,
                 memory_gb=payload.memory_gb,
                 cpu_cores=cpu_cores,

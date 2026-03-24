@@ -2,7 +2,17 @@
 
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, Column, DateTime, Float, ForeignKey, Integer, String
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import relationship
 
 from database import Base
@@ -38,12 +48,18 @@ class Instance(Base):
     """Managed container instance owned by a user."""
 
     __tablename__ = "instances"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id", "display_name", name="uq_instances_user_display_name"
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     container_name = Column(String(128), unique=True, nullable=False, index=True)
+    display_name = Column(String(128), nullable=False)
     container_id = Column(String(128), unique=True, nullable=True)
     gpu_indices = Column(JSON, nullable=False, default=list)
     memory_gb = Column(Integer, nullable=False)
