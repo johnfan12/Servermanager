@@ -150,6 +150,15 @@ class RegisterRequest(BaseModel):
     email: str
 
 
+class InternalUserSyncRequest(BaseModel):
+    """Request body for Clustermanager -> node user sync."""
+
+    username: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9_]+$")
+    email: str = Field(min_length=3, max_length=255)
+    password_hash: str = Field(min_length=1, max_length=255)
+    is_admin: bool = False
+
+
 class InstanceCreateRequest(BaseModel):
     """Request body for creating a new instance."""
 
@@ -1128,6 +1137,64 @@ def verify_internal_service_token(
     expected_token = INTERNAL_SERVICE_TOKEN
     if x_internal_token is None or x_internal_token != expected_token:
         raise HTTPException(status_code=403, detail="Invalid internal service token")
+
+
+@app.post("/api/internal/users/sync")
+def sync_user_from_cluster(
+    payload: InternalUserSyncRequest,
+    _: None = Depends(verify_internal_service_token),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Idempotently create or refresh one node-local user from central auth data."""
+    user = db.query(User).filter(User.username == payload.username).first()
+    created = False
+
+    if user is None:
+        user = User(
+            username=payload.username,
+            email=payload.email,
+            password_hash=payload.password_hash,
+            is_admin=payload.is_admin,
+        )
+        db.add(user)
+        created = True
+    else:
+        user_obj = cast(Any, user)
+        user_obj.password_hash = payload.password_hash
+        user_obj.is_admin = payload.is_admin
+
+        existing_email_owner = (
+            db.query(User)
+            .filter(User.email == payload.email, User.username != payload.username)
+            .first()
+        )
+        if existing_email_owner is None:
+            user_obj.email = payload.email
+        else:
+            LOGGER.warning(
+                "Skipped email sync for user=%s because email=%s is already used by user=%s",
+                payload.username,
+                payload.email,
+                cast(Any, existing_email_owner).username,
+            )
+
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Failed to sync user to node.") from exc
+
+    LOGGER.info(
+        "Synced cluster user to node user=%s created=%s is_admin=%s",
+        payload.username,
+        created,
+        payload.is_admin,
+    )
+    return {
+        "success": True,
+        "created": created,
+        "username": payload.username,
+    }
 
 
 @app.get("/api/frp/containers")
