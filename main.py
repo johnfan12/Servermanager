@@ -803,6 +803,13 @@ def restart_instance(
     """Restart a stopped instance after validating its GPU reservation."""
     instance = _get_instance_for_user(db, instance_id, current_user)
     instance_obj = cast(Any, instance)
+    expire_at = instance_obj.expire_at
+    if expire_at is not None and expire_at <= datetime.utcnow():
+        raise HTTPException(
+            status_code=400,
+            detail="Instance has expired. Please renew before restarting.",
+        )
+
     with gpu_manager.locked_allocation():
         try:
             gpu_indices = list(instance_obj.gpu_indices)
