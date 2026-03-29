@@ -17,6 +17,66 @@
 
 适用于首次在新机器部署，按顺序执行：
 
+#### 1. 安装 FRP
+
+执行 FRP 安装脚本：
+
+```bash
+cd frp
+./install.sh
+```
+
+安装完成后，确认以下服务配置正确：
+- 容器 SSH 隧道：由后端自动维护 per-instance 配置到 `/etc/frp/containers/*.ini`
+- 节点 API 隧道：使用 `/etc/frp/frpc-api.ini` + `frpc-api.service`
+
+#### 2. 安装并初始化 PostgreSQL
+
+安装 PostgreSQL（如未安装）：
+
+```bash
+# Ubuntu/Debian
+sudo apt update
+sudo apt install postgresql postgresql-contrib
+
+# 启动 PostgreSQL 服务
+sudo systemctl start postgresql
+sudo systemctl enable postgresql
+```
+
+创建数据库和账号：
+
+```sql
+sudo -u postgres psql
+CREATE USER server_user WITH PASSWORD 'server_pass';
+CREATE DATABASE server_manager OWNER server_user;
+\q
+```
+
+#### 3. 安装并验证 Docker
+
+安装 Docker（如未安装）：
+
+```bash
+# 检查是否已安装
+docker --version
+
+# 如未安装，执行以下命令（Ubuntu/Debian）
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER
+# 重新登录以使权限生效
+```
+
+验证 Docker 正常工作：
+
+```bash
+docker run hello-world
+```
+
+#### 4. 配置环境变量
+
+进入项目目录并安装 Python 依赖：
+
 ```bash
 cd Servermanager
 
@@ -26,8 +86,20 @@ pip install -r requirements.txt
 
 cp .env.copy .env
 mkdir -p logs runtime
+```
 
-# 升级数据库到最新版本
+编辑 `.env`，至少确认以下配置：
+
+```env
+DATABASE_URL=postgresql+psycopg://server_user:server_pass@127.0.0.1:5432/server_manager
+JWT_SECRET=your-jwt-secret
+INTERNAL_SERVICE_TOKEN=your-internal-token
+FRP_TOKEN=your-frp-token
+```
+
+初始化数据库：
+
+```bash
 alembic current
 alembic upgrade head
 alembic current
@@ -41,55 +113,16 @@ python3 -m alembic -c alembic.ini upgrade head
 python3 -m alembic -c alembic.ini current
 ```
 
-确认 `current` 显示最新 revision 后，再执行 `./start.sh` 启动服务。
-
-### 1. 准备 PostgreSQL
-
-先创建数据库和账号，例如：
-
-```sql
-sudo -u postgres psql
-CREATE USER server_user WITH PASSWORD 'server_pass';
-CREATE DATABASE server_manager OWNER server_user;
-```
-
-### 2. 安装依赖并配置环境
+确认 `current` 显示最新 revision 后，启动服务：
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-cp .env.copy .env
-mkdir -p logs runtime
-```
-
-编辑 `.env`，至少确认：
-
-```env
-DATABASE_URL=postgresql+psycopg://server_user:server_pass@127.0.0.1:5432/server_manager
-JWT_SECRET=your-jwt-secret
-INTERNAL_SERVICE_TOKEN=your-internal-token
-FRP_TOKEN=your-frp-token
-```
-
-### 3. 启动服务
-
-```bash
-
 chmod +x start.sh
 ./start.sh
 ```
 
 默认服务地址：`http://127.0.0.1:18881`
 
-`start.sh` 会先执行：
-
-```bash
-alembic upgrade head
-```
-
-然后再启动 `uvicorn`。
+`start.sh` 会先执行 `alembic upgrade head`，然后再启动 `uvicorn`。
 
 ### 构建即开即用 PyTorch + HuggingFace 镜像
 
@@ -115,12 +148,6 @@ docker build \
   -t lab/pytorch:2.3-cuda12.1-full \
   -f docker/Dockerfile.pytorch_full .
 ```
-
-## FRP 最小说明
-
-- 容器 SSH 隧道：由后端自动维护 per-instance 配置到 `/etc/frp/containers/*.ini`
-- 节点 API 隧道：使用 `/etc/frp/frpc-api.ini` + `frpc-api.service`
-- 安装脚本：`frp/install.sh`
 
 ## 关键配置
 
