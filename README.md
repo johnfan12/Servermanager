@@ -157,6 +157,7 @@ docker build \
 - `FRP_TOKEN`：frps/frpc 共用 token
 - `FRP_CONTAINER_CONFIG_DIR`：默认 `/etc/frp/containers`
 - `ALLOW_REGISTER`：是否开放注册
+- `GPU_HOURS_DEFAULT_QUOTA`：已迁移到 Clustermanager 配置，节点侧不再管理默认卡时
 - Alembic 配置：`alembic.ini`
 
 ### 获取节点 `admin_token`（用于 Clustermanager 的 `NODES_JSON`）
