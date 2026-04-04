@@ -127,7 +127,7 @@ chmod +x start.sh
 ### 构建即开即用 PyTorch + HuggingFace 镜像
 
 ```bash
-docker build -t lab/pytorch:2.3-cuda12.1 -f docker/Dockerfile.pytorch .
+docker build -t lab/pytorch:2.9-cuda12.8 -f docker/Dockerfile.pytorch .
 ```
 
 这个镜像内置了常用深度学习与 HuggingFace 生态包（如 `transformers`、`datasets`、`huggingface_hub`、`accelerate`、`peft`、`timm` 等），创建实例后可直接使用。
@@ -195,6 +195,9 @@ curl -s http://127.0.0.1:18881/api/auth/login \
 - 检查节点 `Servermanager` 是否运行在 18881。
 - 检查 `frpc-api` 是否启动并连到 VPS frps。
 - 检查 VPS `frps.ini` 的 `allow_ports` 是否包含 `18881`。
+- 若日志出现 `proxy [servermanager-api] already exists`：
+  - 避免并行运行 systemd `frpc-api.service` 与 `start.sh` 内置 frpc-api 客户端。
+  - 为每个节点设置唯一 `FRP_API_PROXY_NAME`（如 `servermanager-api-node1`/`servermanager-api-node2`）。
 
 ### Q5: 新增实例后旧实例 SSH 掉线
 - 确认你已切换到 per-instance 模式：

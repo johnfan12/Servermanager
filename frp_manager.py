@@ -16,6 +16,7 @@ from config import (
     FRP_API_CONFIG_FILE,
     FRP_API_ENABLED,
     FRP_API_LOCAL_PORT,
+    FRP_API_PROXY_NAME,
     FRP_API_REMOTE_PORT,
     FRP_CONFIG_FILE,
     FRP_CONFIG_DIR,
@@ -135,7 +136,7 @@ class FrpManager:
             "server_port": str(FRP_SERVER_PORT),
             "token": FRP_TOKEN,
         }
-        config["servermanager-api"] = {
+        config[FRP_API_PROXY_NAME] = {
             "type": "tcp",
             "local_ip": "127.0.0.1",
             "local_port": str(FRP_API_LOCAL_PORT),

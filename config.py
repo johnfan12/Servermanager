@@ -147,6 +147,9 @@ FRP_API_REMOTE_PORT = int(os.environ.get("FRP_API_REMOTE_PORT", "18881"))
 FRP_API_LOCAL_PORT = int(
     os.environ.get("FRP_API_LOCAL_PORT", str(SERVERMANAGER_PORT))
 )
+FRP_API_PROXY_NAME = os.environ.get(
+    "FRP_API_PROXY_NAME", f"servermanager-api-{FRP_API_REMOTE_PORT}"
+)
 FRP_API_CONFIG_FILE = Path(
     os.environ.get("FRP_API_CONFIG_FILE", str(FRP_CONFIG_DIR / "frpc-api.ini"))
 )

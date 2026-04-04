@@ -18,6 +18,7 @@ SERVERMANAGER_PORT="${SERVERMANAGER_PORT:-18881}"
 FRP_API_ENABLED="${FRP_API_ENABLED:-true}"
 FRP_API_REMOTE_PORT="${FRP_API_REMOTE_PORT:-18881}"
 FRP_API_LOCAL_PORT="${FRP_API_LOCAL_PORT:-$SERVERMANAGER_PORT}"
+FRP_API_PROXY_NAME="${FRP_API_PROXY_NAME:-servermanager-api-${FRP_API_REMOTE_PORT}}"
 FRP_CLIENT_BIN="${FRP_CLIENT_BIN:-/usr/local/bin/frpc}"
 FRP_API_CONFIG_FILE="${FRP_API_CONFIG_FILE:-$ROOT_DIR/runtime/frpc-api.ini}"
 FRP_API_PID_FILE="${FRP_API_PID_FILE:-$ROOT_DIR/runtime/frpc-api.pid}"
@@ -51,13 +52,20 @@ start_api_frp_client() {
     return
   fi
 
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active --quiet frpc-api.service; then
+      echo "[start.sh] detected active frpc-api.service; skip local API client startup"
+      return
+    fi
+  fi
+
   cat > "$FRP_API_CONFIG_FILE" <<EOF
 [common]
 server_addr = ${FRP_SERVER_ADDR}
 server_port = ${FRP_SERVER_PORT:-7000}
 token = ${FRP_TOKEN}
 
-[servermanager-api]
+[${FRP_API_PROXY_NAME}]
 type = tcp
 local_ip = 127.0.0.1
 local_port = ${FRP_API_LOCAL_PORT}
@@ -77,7 +85,7 @@ EOF
 
   "$FRP_CLIENT_BIN" -c "$FRP_API_CONFIG_FILE" > "$FRP_API_LOG_FILE" 2>&1 &
   echo $! > "$FRP_API_PID_FILE"
-  echo "[start.sh] started API FRP client on remote port ${FRP_API_REMOTE_PORT}"
+  echo "[start.sh] started API FRP client ${FRP_API_PROXY_NAME} on remote port ${FRP_API_REMOTE_PORT}"
 }
 
 trap cleanup EXIT INT TERM
