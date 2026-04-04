@@ -32,6 +32,9 @@ from frp_manager import FrpManager
 LOGGER = logging.getLogger(__name__)
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+PERSISTENT_PYTHON_ROOT_NAME = ".instance_python_envs"
+PERSISTENT_PYTHON_MOUNT_PATH = "/root/persist"
+PERSISTENT_PYTHON_VENV_PATH = f"{PERSISTENT_PYTHON_MOUNT_PATH}/venv"
 
 
 class ContainerManager:
@@ -128,6 +131,19 @@ class ContainerManager:
                 f"Failed to prepare user workspace directory under {self._data_root}: {exc}"
             ) from exc
 
+    def _ensure_user_persistent_python_root(self, username: str) -> Path:
+        """Ensure the per-user root for persistent Python environments exists."""
+        user_dir = self._ensure_user_data_dir(username)
+        persistent_root = self._safe_path(user_dir, PERSISTENT_PYTHON_ROOT_NAME)
+        try:
+            persistent_root.mkdir(parents=True, exist_ok=True)
+            return persistent_root
+        except OSError as exc:
+            raise RuntimeError(
+                "Failed to prepare persistent Python environment directory "
+                f"under {persistent_root}: {exc}"
+            ) from exc
+
     def get_instance_workspace_dir(
         self, username: str, container_name: str, create: bool = True
     ) -> Path:
@@ -183,6 +199,35 @@ class ContainerManager:
                 container_name,
                 username,
             )
+        return None
+
+    def get_instance_persistent_python_dir(
+        self, username: str, container_name: str, create: bool = True
+    ) -> Path:
+        """Return the dedicated persistent Python directory for an instance."""
+        safe_container_name = self._validated_segment(container_name, "Container name")
+        persistent_dir = self._safe_path(
+            self._ensure_user_persistent_python_root(username), safe_container_name
+        )
+        if create:
+            persistent_dir.mkdir(parents=True, exist_ok=True)
+        return persistent_dir
+
+    def locate_instance_persistent_python_dir(
+        self, username: str, container_name: str
+    ) -> Path | None:
+        """Locate an existing dedicated persistent Python directory for an instance."""
+        safe_username = self._validated_username(username)
+        safe_container_name = self._validated_segment(container_name, "Container name")
+        roots = [
+            self._safe_path(Path(DATA_DIR), safe_username),
+            self._safe_path(Path(FALLBACK_DATA_DIR), safe_username),
+        ]
+        for root in roots:
+            persistent_root = self._safe_path(root, PERSISTENT_PYTHON_ROOT_NAME)
+            persistent_dir = self._safe_path(persistent_root, safe_container_name)
+            if persistent_dir.exists():
+                return persistent_dir
         return None
 
     def _workspace_helper_image(self) -> str:
@@ -264,11 +309,31 @@ class ContainerManager:
         encoded_keys = base64.b64encode(
             authorized_keys_content.encode("utf-8")
         ).decode("ascii")
+        profile_script = (
+            f'export PERSIST_VENV="{PERSISTENT_PYTHON_VENV_PATH}"\n'
+            'if [ -x "$PERSIST_VENV/bin/python" ]; then\n'
+            '  export VIRTUAL_ENV="$PERSIST_VENV"\n'
+            '  export PATH="$PERSIST_VENV/bin:$PATH"\n'
+            "fi\n"
+        )
+        encoded_profile_script = base64.b64encode(
+            profile_script.encode("utf-8")
+        ).decode("ascii")
+        shell_hook = "[ -f /etc/profile.d/persistent-python.sh ] && . /etc/profile.d/persistent-python.sh"
         return (
             '/bin/bash -lc "mkdir -p /var/run/sshd; '
             'mkdir -p /root/.ssh; chmod 700 /root/.ssh; '
             f"printf %s {shlex.quote(encoded_keys)} | base64 -d > /root/.ssh/authorized_keys; "
             'chmod 600 /root/.ssh/authorized_keys; '
+            f"mkdir -p {shlex.quote(PERSISTENT_PYTHON_MOUNT_PATH)}; "
+            f"if [ ! -x {shlex.quote(PERSISTENT_PYTHON_VENV_PATH + '/bin/python')} ]; then "
+            f"python -m venv --system-site-packages {shlex.quote(PERSISTENT_PYTHON_VENV_PATH)} && "
+            f"{shlex.quote(PERSISTENT_PYTHON_VENV_PATH + '/bin/python')} -m pip install --upgrade pip setuptools wheel; "
+            "fi; "
+            f"printf %s {shlex.quote(encoded_profile_script)} | base64 -d > /etc/profile.d/persistent-python.sh; "
+            "chmod 644 /etc/profile.d/persistent-python.sh; "
+            f"touch /root/.bashrc /root/.profile; grep -qxF {shlex.quote(shell_hook)} /root/.bashrc || printf '%s\\n' {shlex.quote(shell_hook)} >> /root/.bashrc; "
+            f"grep -qxF {shlex.quote(shell_hook)} /root/.profile || printf '%s\\n' {shlex.quote(shell_hook)} >> /root/.profile; "
             f"echo root:{password} | chpasswd; "
             "(service ssh start || /etc/init.d/ssh start || /usr/sbin/sshd); "
             'trap : TERM INT; sleep infinity & wait"'
@@ -358,12 +423,16 @@ class ContainerManager:
         image_name: str,
         container_name: str,
         workspace_dir: Path | None = None,
+        persistent_python_dir: Path | None = None,
         authorized_keys: list[str] | None = None,
     ) -> dict[str, int | str]:
         """Create and start a GPU-enabled user container."""
         image_ref = self._ensure_image_available(image_name)
         ssh_password = self._generate_password()
         workspace_path = workspace_dir or self.get_instance_workspace_dir(
+            username, container_name
+        )
+        persistent_python_path = persistent_python_dir or self.get_instance_persistent_python_dir(
             username, container_name
         )
         container: Container | None = None
@@ -385,6 +454,10 @@ class ContainerManager:
                         "volumes": {
                             str(workspace_path): {
                                 "bind": "/root/workspace",
+                                "mode": "rw",
+                            },
+                            str(persistent_python_path): {
+                                "bind": PERSISTENT_PYTHON_MOUNT_PATH,
                                 "mode": "rw",
                             }
                         },

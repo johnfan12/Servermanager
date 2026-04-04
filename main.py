@@ -298,6 +298,9 @@ def _delete_instance(db: Session, instance: Instance) -> None:
     cleanup_workspace = container_manager.locate_instance_workspace_cleanup_dir(
         str(instance_obj.user.username), str(instance_obj.container_name)
     )
+    cleanup_persistent_python = container_manager.locate_instance_persistent_python_dir(
+        str(instance_obj.user.username), str(instance_obj.container_name)
+    )
     try:
         container_manager.remove_container(str(instance_obj.container_name))
     except RuntimeError as exc:
@@ -307,6 +310,11 @@ def _delete_instance(db: Session, instance: Instance) -> None:
     if cleanup_workspace is not None:
         try:
             container_manager.remove_workspace(cleanup_workspace)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+    if cleanup_persistent_python is not None:
+        try:
+            container_manager.remove_workspace(cleanup_persistent_python)
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -343,6 +351,17 @@ def _schedule_backup_cleanup(backup_path: Path) -> None:
             container_manager.remove_workspace(backup_path)
         except RuntimeError as exc:
             LOGGER.warning("Failed to remove temporary backup %s: %s", backup_path, exc)
+
+
+def _cleanup_instance_storage_dirs(*paths: Path | None) -> None:
+    """Best-effort cleanup for host-side instance directories."""
+    for path in paths:
+        if path is None:
+            continue
+        try:
+            container_manager.remove_workspace(path)
+        except RuntimeError:
+            continue
 
 
 def _rebuild_instance_with_new_gpus(
@@ -675,6 +694,9 @@ def create_instance(
     workspace_path = container_manager.get_instance_workspace_dir(
         str(current_user_obj.username), container_name
     )
+    persistent_python_path = container_manager.get_instance_persistent_python_dir(
+        str(current_user_obj.username), container_name
+    )
     container_created = False
 
     with gpu_manager.locked_allocation():
@@ -723,6 +745,7 @@ def create_instance(
                 image_name=resolved_image_ref,
                 container_name=container_name,
                 workspace_dir=workspace_path,
+                persistent_python_dir=persistent_python_path,
                 authorized_keys=_get_user_authorized_keys(db, int(current_user_obj.id)),
             )
             container_created = True
@@ -745,10 +768,7 @@ def create_instance(
                     container_manager.remove_container(container_name)
                 except RuntimeError:
                     pass
-                try:
-                    container_manager.remove_workspace(workspace_path)
-                except RuntimeError:
-                    pass
+            _cleanup_instance_storage_dirs(workspace_path, persistent_python_path)
             db.rollback()
             raise
         except ValueError as exc:
@@ -757,10 +777,7 @@ def create_instance(
                     container_manager.remove_container(container_name)
                 except RuntimeError:
                     pass
-                try:
-                    container_manager.remove_workspace(workspace_path)
-                except RuntimeError:
-                    pass
+            _cleanup_instance_storage_dirs(workspace_path, persistent_python_path)
             db.rollback()
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
@@ -769,10 +786,7 @@ def create_instance(
                     container_manager.remove_container(container_name)
                 except RuntimeError:
                     pass
-                try:
-                    container_manager.remove_workspace(workspace_path)
-                except RuntimeError:
-                    pass
+            _cleanup_instance_storage_dirs(workspace_path, persistent_python_path)
             db.rollback()
             status_code = 503 if "Unable to connect to Docker" in str(exc) else 500
             raise HTTPException(status_code=status_code, detail=str(exc)) from exc
@@ -782,10 +796,7 @@ def create_instance(
                     container_manager.remove_container(container_name)
                 except RuntimeError:
                     pass
-                try:
-                    container_manager.remove_workspace(workspace_path)
-                except RuntimeError:
-                    pass
+            _cleanup_instance_storage_dirs(workspace_path, persistent_python_path)
             db.rollback()
             raise HTTPException(
                 status_code=500, detail=f"Failed to create instance: {exc}"
