@@ -1,26 +1,50 @@
-FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Etc/UTC \
     PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
     HF_HOME=/root/.cache/huggingface
 
-# System tools + SSH for Servermanager instance access
+# Base tools + Python 3.11
 RUN apt-get update && apt-get install -y \
-    openssh-server \
-    vim \
-    git \
-    wget \
+    software-properties-common \
     curl \
+    wget \
+    git \
+    vim \
     htop \
     tmux \
     net-tools \
+    openssh-server \
     build-essential \
+    pkg-config \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update && apt-get install -y \
+    python3.11 \
+    python3.11-dev \
+    python3.11-venv \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Common deep-learning and Hugging Face ecosystem packages
-RUN python -m pip install --upgrade pip setuptools wheel && \
-    pip install \
+# Upgrade pip tooling
+RUN python -m pip install --upgrade pip setuptools wheel
+
+# Install PyTorch (CUDA 12.8)
+RUN pip install \
+    torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# Common deep learning stack
+RUN pip install \
     jupyterlab \
+    notebook \
     ipywidgets \
     numpy \
     scipy \
@@ -42,14 +66,30 @@ RUN python -m pip install --upgrade pip setuptools wheel && \
     accelerate \
     peft \
     evaluate \
-    timm
+    timm \
+    xgboost \
+    lightgbm \
+    pyarrow \
+    pyyaml \
+    rich \
+    ipdb
 
-RUN mkdir -p /var/run/sshd
+# Optional but useful for many training repos
+RUN pip install \
+    lightning \
+    deepspeed
 
-# Password auth is set by Servermanager container startup logic
-RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
+# SSH
+RUN mkdir -p /var/run/sshd && \
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config && \
     echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
 
-EXPOSE 22
+# Self-check during build
+RUN python -c "import sys; print(sys.version)" && \
+    python -c "import torch; print('torch=', torch.__version__); print('cuda=', torch.version.cuda); print('cuda_available=', torch.cuda.is_available())"
+
+WORKDIR /workspace
+
+EXPOSE 22 8888
 
 CMD ["/usr/sbin/sshd", "-D"]
