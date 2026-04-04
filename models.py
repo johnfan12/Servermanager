@@ -11,6 +11,7 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     String,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
@@ -41,6 +42,9 @@ class User(Base):
     )
     gpu_hour_ledgers = relationship(
         "GPUHourLedger", back_populates="user", cascade="all, delete-orphan"
+    )
+    ssh_keys = relationship(
+        "UserSSHKey", back_populates="user", cascade="all, delete-orphan"
     )
 
 
@@ -120,3 +124,33 @@ class GPUHourLedger(Base):
 
     user = relationship("User", back_populates="gpu_hour_ledgers")
     instance = relationship("Instance", back_populates="gpu_hour_ledgers")
+
+
+class UserSSHKey(Base):
+    """Node-local copy of one user's SSH public key."""
+
+    __tablename__ = "user_ssh_keys"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "fingerprint",
+            name="uq_user_ssh_keys_user_id_fingerprint",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    public_key = Column(Text, nullable=False)
+    remark = Column(String(255), nullable=False, default="")
+    fingerprint = Column(String(255), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(
+        DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    user = relationship("User", back_populates="ssh_keys")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import random
@@ -255,10 +256,19 @@ class ContainerManager:
         shell_command = f"rm -rf {shlex.quote(workspace_name)}"
         self._run_workspace_helper(parent_dir, shell_command)
 
-    def _build_start_command(self, password: str) -> str:
+    def _build_start_command(self, password: str, authorized_keys: list[str]) -> str:
         """Return the container start command that configures SSH."""
+        authorized_keys_content = "\n".join(
+            key.strip() for key in authorized_keys if key and key.strip()
+        )
+        encoded_keys = base64.b64encode(
+            authorized_keys_content.encode("utf-8")
+        ).decode("ascii")
         return (
             '/bin/bash -lc "mkdir -p /var/run/sshd; '
+            'mkdir -p /root/.ssh; chmod 700 /root/.ssh; '
+            f"printf %s {shlex.quote(encoded_keys)} | base64 -d > /root/.ssh/authorized_keys; "
+            'chmod 600 /root/.ssh/authorized_keys; '
             f"echo root:{password} | chpasswd; "
             "(service ssh start || /etc/init.d/ssh start || /usr/sbin/sshd); "
             'trap : TERM INT; sleep infinity & wait"'
@@ -348,6 +358,7 @@ class ContainerManager:
         image_name: str,
         container_name: str,
         workspace_dir: Path | None = None,
+        authorized_keys: list[str] | None = None,
     ) -> dict[str, int | str]:
         """Create and start a GPU-enabled user container."""
         image_ref = self._ensure_image_available(image_name)
@@ -366,7 +377,10 @@ class ContainerManager:
                         "detach": True,
                         "tty": True,
                         "stdin_open": True,
-                        "command": self._build_start_command(ssh_password),
+                        "command": self._build_start_command(
+                            ssh_password,
+                            authorized_keys or [],
+                        ),
                         "ports": {"22/tcp": ssh_port},
                         "volumes": {
                             str(workspace_path): {

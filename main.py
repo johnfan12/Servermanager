@@ -41,7 +41,7 @@ from config import (
 from container_manager import ContainerManager
 from database import SessionLocal, get_db, init_db
 from gpu_manager import GPUManager
-from models import GPUAllocation, Instance, User
+from models import GPUAllocation, Instance, User, UserSSHKey
 from scheduler import InstanceScheduler
 
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -150,6 +150,14 @@ class RegisterRequest(BaseModel):
     email: str
 
 
+class InternalSSHKeySyncRequest(BaseModel):
+    """One SSH public key row pushed from cluster manager."""
+
+    public_key: str = Field(min_length=1, max_length=8192)
+    remark: str = Field(default="", max_length=255)
+    fingerprint: str = Field(min_length=1, max_length=255)
+
+
 class InternalUserSyncRequest(BaseModel):
     """Request body for Clustermanager -> node user sync."""
 
@@ -157,6 +165,7 @@ class InternalUserSyncRequest(BaseModel):
     email: str = Field(min_length=3, max_length=255)
     password_hash: str = Field(min_length=1, max_length=255)
     is_admin: bool = False
+    ssh_public_keys: list[InternalSSHKeySyncRequest] = Field(default_factory=list)
 
 
 class InstanceCreateRequest(BaseModel):
@@ -257,6 +266,17 @@ def _get_node_running_memory_gb(db: Session) -> int:
     for instance in running_instances:
         total += int(cast(Any, instance).memory_gb)
     return total
+
+
+def _get_user_authorized_keys(db: Session, user_id: int) -> list[str]:
+    """Return all synced SSH public keys for one user."""
+    keys = (
+        db.query(UserSSHKey)
+        .filter(UserSSHKey.user_id == user_id)
+        .order_by(UserSSHKey.created_at.asc(), UserSSHKey.id.asc())
+        .all()
+    )
+    return [str(key.public_key) for key in keys if str(key.public_key).strip()]
 
 
 def _get_instance_for_user(db: Session, instance_id: int, user: User) -> Instance:
@@ -373,6 +393,7 @@ def _rebuild_instance_with_new_gpus(
             image_name=str(instance_obj.image_name),
             container_name=str(instance_obj.container_name),
             workspace_dir=target_workspace,
+            authorized_keys=_get_user_authorized_keys(db, int(user_obj.id)),
         )
         instance_obj.container_id = str(container_info["container_id"])
         instance_obj.ssh_port = int(container_info["ssh_port"])
@@ -702,6 +723,7 @@ def create_instance(
                 image_name=resolved_image_ref,
                 container_name=container_name,
                 workspace_dir=workspace_path,
+                authorized_keys=_get_user_authorized_keys(db, int(current_user_obj.id)),
             )
             container_created = True
             instance_obj = cast(Any, instance)
@@ -1178,6 +1200,40 @@ def sync_user_from_cluster(
                 cast(Any, existing_email_owner).username,
             )
 
+    db.flush()
+    user_obj = cast(Any, user)
+    existing_keys = (
+        db.query(UserSSHKey)
+        .filter(UserSSHKey.user_id == int(user_obj.id))
+        .all()
+    )
+    existing_by_fingerprint = {
+        str(key.fingerprint): key
+        for key in existing_keys
+        if str(key.fingerprint or "").strip()
+    }
+    incoming_fingerprints: set[str] = set()
+    for key_payload in payload.ssh_public_keys:
+        fingerprint = str(key_payload.fingerprint)
+        incoming_fingerprints.add(fingerprint)
+        existing_key = existing_by_fingerprint.get(fingerprint)
+        if existing_key is None:
+            db.add(
+                UserSSHKey(
+                    user_id=int(user_obj.id),
+                    public_key=key_payload.public_key,
+                    remark=key_payload.remark,
+                    fingerprint=fingerprint,
+                )
+            )
+        else:
+            existing_key.public_key = key_payload.public_key
+            existing_key.remark = key_payload.remark
+
+    for fingerprint, existing_key in existing_by_fingerprint.items():
+        if fingerprint not in incoming_fingerprints:
+            db.delete(existing_key)
+
     try:
         db.commit()
     except IntegrityError as exc:
@@ -1185,15 +1241,17 @@ def sync_user_from_cluster(
         raise HTTPException(status_code=409, detail="Failed to sync user to node.") from exc
 
     LOGGER.info(
-        "Synced cluster user to node user=%s created=%s is_admin=%s",
+        "Synced cluster user to node user=%s created=%s is_admin=%s ssh_keys=%s",
         payload.username,
         created,
         payload.is_admin,
+        len(payload.ssh_public_keys),
     )
     return {
         "success": True,
         "created": created,
         "username": payload.username,
+        "ssh_key_count": len(payload.ssh_public_keys),
     }
 
 

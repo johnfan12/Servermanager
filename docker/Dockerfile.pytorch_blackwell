@@ -31,6 +31,7 @@ RUN mkdir -p /var/run/sshd
 
 # 允许 root 通过密码登录（container_manager 会在启动后动态设置密码）
 RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config \
+    && echo 'PubkeyAuthentication yes' >> /etc/ssh/sshd_config \
     && echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
 
 # NGC 镜像默认 CMD 会启动 Jupyter，此处覆盖为 sshd

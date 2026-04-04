@@ -7,9 +7,9 @@ from sqlalchemy import engine_from_config, pool
 
 import config
 from database import Base
-from models import GPUAllocation, Instance, User
+from models import GPUAllocation, Instance, User, UserSSHKey
 
-del GPUAllocation, Instance, User
+del GPUAllocation, Instance, User, UserSSHKey
 
 config_section = context.config
 if config_section.config_file_name is not None:
