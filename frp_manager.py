@@ -362,11 +362,12 @@ class FrpManager:
             return True
         try:
             self.instance_config_dir.mkdir(parents=True, exist_ok=True)
-            LOGGER.info(
-                "Reconciling per-container FRP services for %d containers: %s",
-                len(containers),
-                [c.get("name") for c in containers],
-            )
+            message = "Reconciling per-container FRP services for %d containers: %s"
+            args = (len(containers), [c.get("name") for c in containers])
+            if containers:
+                LOGGER.info(message, *args)
+            else:
+                LOGGER.debug(message, *args)
             return self._reconcile(containers)
         except Exception as exc:
             LOGGER.error("Failed to reconcile per-container FRP services: %s", exc)
