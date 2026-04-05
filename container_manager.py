@@ -11,6 +11,7 @@ import secrets
 import shlex
 import socket
 import string
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from docker.errors import DockerException, ImageNotFound, NotFound
 from docker.models.containers import Container
 from docker.types import DeviceRequest
 from filelock import FileLock
+from requests import exceptions as requests_exceptions
 
 from config import (
     DATA_DIR,
@@ -26,15 +28,14 @@ from config import (
     FALLBACK_DATA_DIR,
     LOCK_DIR,
     PORT_RANGE,
+    SNAPSHOT_COMMIT_TIMEOUT_SECONDS,
 )
 from frp_manager import FrpManager
 
 LOGGER = logging.getLogger(__name__)
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-PERSISTENT_PYTHON_ROOT_NAME = ".instance_python_envs"
-PERSISTENT_PYTHON_MOUNT_PATH = "/root/persist"
-PERSISTENT_PYTHON_VENV_PATH = f"{PERSISTENT_PYTHON_MOUNT_PATH}/venv"
+SNAPSHOT_IMAGE_REPOSITORY = "servermanager-snapshots"
 
 
 class ContainerManager:
@@ -131,19 +132,6 @@ class ContainerManager:
                 f"Failed to prepare user workspace directory under {self._data_root}: {exc}"
             ) from exc
 
-    def _ensure_user_persistent_python_root(self, username: str) -> Path:
-        """Ensure the per-user root for persistent Python environments exists."""
-        user_dir = self._ensure_user_data_dir(username)
-        persistent_root = self._safe_path(user_dir, PERSISTENT_PYTHON_ROOT_NAME)
-        try:
-            persistent_root.mkdir(parents=True, exist_ok=True)
-            return persistent_root
-        except OSError as exc:
-            raise RuntimeError(
-                "Failed to prepare persistent Python environment directory "
-                f"under {persistent_root}: {exc}"
-            ) from exc
-
     def get_instance_workspace_dir(
         self, username: str, container_name: str, create: bool = True
     ) -> Path:
@@ -199,35 +187,6 @@ class ContainerManager:
                 container_name,
                 username,
             )
-        return None
-
-    def get_instance_persistent_python_dir(
-        self, username: str, container_name: str, create: bool = True
-    ) -> Path:
-        """Return the dedicated persistent Python directory for an instance."""
-        safe_container_name = self._validated_segment(container_name, "Container name")
-        persistent_dir = self._safe_path(
-            self._ensure_user_persistent_python_root(username), safe_container_name
-        )
-        if create:
-            persistent_dir.mkdir(parents=True, exist_ok=True)
-        return persistent_dir
-
-    def locate_instance_persistent_python_dir(
-        self, username: str, container_name: str
-    ) -> Path | None:
-        """Locate an existing dedicated persistent Python directory for an instance."""
-        safe_username = self._validated_username(username)
-        safe_container_name = self._validated_segment(container_name, "Container name")
-        roots = [
-            self._safe_path(Path(DATA_DIR), safe_username),
-            self._safe_path(Path(FALLBACK_DATA_DIR), safe_username),
-        ]
-        for root in roots:
-            persistent_root = self._safe_path(root, PERSISTENT_PYTHON_ROOT_NAME)
-            persistent_dir = self._safe_path(persistent_root, safe_container_name)
-            if persistent_dir.exists():
-                return persistent_dir
         return None
 
     def _workspace_helper_image(self) -> str:
@@ -309,31 +268,11 @@ class ContainerManager:
         encoded_keys = base64.b64encode(
             authorized_keys_content.encode("utf-8")
         ).decode("ascii")
-        profile_script = (
-            f'export PERSIST_VENV="{PERSISTENT_PYTHON_VENV_PATH}"\n'
-            'if [ -x "$PERSIST_VENV/bin/python" ]; then\n'
-            '  export VIRTUAL_ENV="$PERSIST_VENV"\n'
-            '  export PATH="$PERSIST_VENV/bin:$PATH"\n'
-            "fi\n"
-        )
-        encoded_profile_script = base64.b64encode(
-            profile_script.encode("utf-8")
-        ).decode("ascii")
-        shell_hook = "[ -f /etc/profile.d/persistent-python.sh ] && . /etc/profile.d/persistent-python.sh"
         return (
             '/bin/bash -lc "mkdir -p /var/run/sshd; '
             'mkdir -p /root/.ssh; chmod 700 /root/.ssh; '
             f"printf %s {shlex.quote(encoded_keys)} | base64 -d > /root/.ssh/authorized_keys; "
             'chmod 600 /root/.ssh/authorized_keys; '
-            f"mkdir -p {shlex.quote(PERSISTENT_PYTHON_MOUNT_PATH)}; "
-            f"if [ ! -x {shlex.quote(PERSISTENT_PYTHON_VENV_PATH + '/bin/python')} ]; then "
-            f"python -m venv --system-site-packages {shlex.quote(PERSISTENT_PYTHON_VENV_PATH)} && "
-            f"{shlex.quote(PERSISTENT_PYTHON_VENV_PATH + '/bin/python')} -m pip install --upgrade pip setuptools wheel; "
-            "fi; "
-            f"printf %s {shlex.quote(encoded_profile_script)} | base64 -d > /etc/profile.d/persistent-python.sh; "
-            "chmod 644 /etc/profile.d/persistent-python.sh; "
-            f"touch /root/.bashrc /root/.profile; grep -qxF {shlex.quote(shell_hook)} /root/.bashrc || printf '%s\\n' {shlex.quote(shell_hook)} >> /root/.bashrc; "
-            f"grep -qxF {shlex.quote(shell_hook)} /root/.profile || printf '%s\\n' {shlex.quote(shell_hook)} >> /root/.profile; "
             f"echo root:{password} | chpasswd; "
             "(service ssh start || /etc/init.d/ssh start || /usr/sbin/sshd); "
             'trap : TERM INT; sleep infinity & wait"'
@@ -414,6 +353,93 @@ class ContainerManager:
         """Public wrapper for validating Docker image selection."""
         return self._ensure_image_available(image_ref)
 
+    def is_snapshot_image(self, image_ref: str | None) -> bool:
+        """Return whether one image ref belongs to the managed snapshot repository."""
+        if not image_ref:
+            return False
+        return image_ref.startswith(f"{SNAPSHOT_IMAGE_REPOSITORY}:")
+
+    def _snapshot_image_ref(self, container_name: str) -> str:
+        """Return a new snapshot image reference for one container."""
+        snapshot_tag = (
+            f"{container_name}-"
+            f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}-"
+            f"{secrets.token_hex(3)}"
+        )
+        return f"{SNAPSHOT_IMAGE_REPOSITORY}:{snapshot_tag}"
+
+    def snapshot_container(self, container_name: str) -> str:
+        """Commit the current container filesystem into one managed snapshot image."""
+        snapshot_ref = self._snapshot_image_ref(container_name)
+        _, snapshot_tag = snapshot_ref.split(":", 1)
+        snapshot_client: docker.APIClient | None = None
+        try:
+            container = self._container_by_name(container_name)
+            snapshot_client = docker.from_env(
+                timeout=SNAPSHOT_COMMIT_TIMEOUT_SECONDS
+            ).api
+            snapshot_client.commit(
+                container.id,
+                repository=SNAPSHOT_IMAGE_REPOSITORY,
+                tag=snapshot_tag,
+                pause=False,
+            )
+            self._ensure_image_available(snapshot_ref)
+            return snapshot_ref
+        except requests_exceptions.ReadTimeout as exc:
+            raise RuntimeError(
+                "Failed to snapshot container "
+                f"{container_name}: Docker commit exceeded "
+                f"{SNAPSHOT_COMMIT_TIMEOUT_SECONDS}s. "
+                "Increase SNAPSHOT_COMMIT_TIMEOUT_SECONDS if this instance has a large filesystem."
+            ) from exc
+        except DockerException as exc:
+            raise RuntimeError(
+                f"Failed to snapshot container {container_name}: {exc}"
+            ) from exc
+        finally:
+            if snapshot_client is not None:
+                try:
+                    snapshot_client.close()
+                except Exception:
+                    pass
+
+    def update_container_resources(
+        self,
+        container_name: str,
+        *,
+        memory_gb: int,
+        cpu_cores: int,
+    ) -> None:
+        """Update one existing container's memory and CPU limits in place."""
+        cpu_period = 100_000
+        cpu_quota = max(1, int(cpu_cores)) * cpu_period
+        try:
+            self._container_by_name(container_name).update(
+                mem_limit=f"{memory_gb}g",
+                memswap_limit=f"{memory_gb}g",
+                cpu_period=cpu_period,
+                cpu_quota=cpu_quota,
+            )
+        except DockerException as exc:
+            raise RuntimeError(
+                f"Failed to update resources for container {container_name}: {exc}"
+            ) from exc
+
+    def remove_image(self, image_ref: str) -> None:
+        """Remove one local Docker image by reference."""
+        normalized = image_ref.strip()
+        if not normalized:
+            return
+        try:
+            self._docker_client().images.remove(normalized, force=True)
+        except ImageNotFound:
+            return
+        except DockerException as exc:
+            raise RuntimeError(
+                f"Failed to remove Docker image {normalized}: {exc}"
+            ) from exc
+
     def create_container(
         self,
         username: str,
@@ -423,16 +449,12 @@ class ContainerManager:
         image_name: str,
         container_name: str,
         workspace_dir: Path | None = None,
-        persistent_python_dir: Path | None = None,
         authorized_keys: list[str] | None = None,
     ) -> dict[str, int | str]:
         """Create and start a GPU-enabled user container."""
         image_ref = self._ensure_image_available(image_name)
         ssh_password = self._generate_password()
         workspace_path = workspace_dir or self.get_instance_workspace_dir(
-            username, container_name
-        )
-        persistent_python_path = persistent_python_dir or self.get_instance_persistent_python_dir(
             username, container_name
         )
         container: Container | None = None
@@ -454,10 +476,6 @@ class ContainerManager:
                         "volumes": {
                             str(workspace_path): {
                                 "bind": "/root/workspace",
-                                "mode": "rw",
-                            },
-                            str(persistent_python_path): {
-                                "bind": PERSISTENT_PYTHON_MOUNT_PATH,
                                 "mode": "rw",
                             }
                         },

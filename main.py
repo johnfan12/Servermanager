@@ -14,6 +14,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
@@ -232,6 +233,13 @@ def _serialize_instance(instance: Instance) -> dict[str, Any]:
         else None,
         "vps_access": instance_obj.vps_access,
         "image_name": instance_obj.image_name,
+        "base_image_name": instance_obj.base_image_name or instance_obj.image_name,
+        "runtime_image_name": instance_obj.runtime_image_name or instance_obj.image_name,
+        "last_snapshot_image_name": instance_obj.last_snapshot_image_name,
+        "last_snapshot_at": instance_obj.last_snapshot_at.isoformat()
+        if instance_obj.last_snapshot_at is not None
+        else None,
+        "snapshot_status": instance_obj.snapshot_status or "none",
         "status": instance_obj.status,
         "created_at": instance_obj.created_at.isoformat(),
         "stopped_at": stopped_at.isoformat() if stopped_at is not None else None,
@@ -292,13 +300,60 @@ def _get_instance_for_user(db: Session, instance_id: int, user: User) -> Instanc
     return instance
 
 
+def _runtime_image_for_instance(instance: Instance) -> str:
+    """Return the effective image used to boot the current instance container."""
+    instance_obj = cast(Any, instance)
+    return str(instance_obj.runtime_image_name or instance_obj.image_name)
+
+
+def _instance_is_running(instance: Instance) -> bool:
+    """Return whether the instance is currently marked as running."""
+    return str(cast(Any, instance).status) == "running"
+
+
+def _add_gpu_allocations(db: Session, instance_id: int, gpu_indices: list[int]) -> None:
+    """Insert GPU allocation rows for one instance."""
+    for gpu_index in gpu_indices:
+        db.add(GPUAllocation(gpu_index=gpu_index, instance_id=instance_id))
+
+
+def _cleanup_snapshot_image_if_unused(
+    db: Session,
+    image_ref: str | None,
+    *,
+    exclude_instance_id: int | None = None,
+) -> None:
+    """Delete one managed snapshot image when no instance metadata references it."""
+    if not container_manager.is_snapshot_image(image_ref):
+        return
+    query = db.query(Instance).filter(
+        or_(
+            Instance.runtime_image_name == image_ref,
+            Instance.last_snapshot_image_name == image_ref,
+        )
+    )
+    if exclude_instance_id is not None:
+        query = query.filter(Instance.id != exclude_instance_id)
+    if query.first() is not None:
+        return
+    try:
+        container_manager.remove_image(str(image_ref))
+    except RuntimeError as exc:
+        LOGGER.warning("Failed to cleanup unused snapshot image %s: %s", image_ref, exc)
+
+
 def _delete_instance(db: Session, instance: Instance) -> None:
     """Delete a container instance and clean related allocations."""
     instance_obj = cast(Any, instance)
+    snapshot_images_to_cleanup = {
+        image_ref
+        for image_ref in [
+            str(instance_obj.runtime_image_name or ""),
+            str(instance_obj.last_snapshot_image_name or ""),
+        ]
+        if container_manager.is_snapshot_image(image_ref)
+    }
     cleanup_workspace = container_manager.locate_instance_workspace_cleanup_dir(
-        str(instance_obj.user.username), str(instance_obj.container_name)
-    )
-    cleanup_persistent_python = container_manager.locate_instance_persistent_python_dir(
         str(instance_obj.user.username), str(instance_obj.container_name)
     )
     try:
@@ -312,11 +367,6 @@ def _delete_instance(db: Session, instance: Instance) -> None:
             container_manager.remove_workspace(cleanup_workspace)
         except RuntimeError as exc:
             raise HTTPException(status_code=500, detail=str(exc)) from exc
-    if cleanup_persistent_python is not None:
-        try:
-            container_manager.remove_workspace(cleanup_persistent_python)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     gpu_manager.release(str(instance_obj.container_name), db)
     LOGGER.info(
@@ -326,6 +376,8 @@ def _delete_instance(db: Session, instance: Instance) -> None:
     )
     db.delete(instance)
     db.commit()
+    for image_ref in snapshot_images_to_cleanup:
+        _cleanup_snapshot_image_if_unused(db, image_ref)
 
 
 def _schedule_backup_cleanup(backup_path: Path) -> None:
@@ -364,6 +416,69 @@ def _cleanup_instance_storage_dirs(*paths: Path | None) -> None:
             continue
 
 
+def _restore_instance_container(
+    db: Session,
+    instance: Instance,
+    user: User,
+    *,
+    image_name: str,
+    gpu_indices: list[int],
+    memory_gb: int,
+    cpu_cores: int,
+    workspace_dir: Path,
+    running: bool,
+    stopped_at: datetime | None,
+) -> None:
+    """Create one container for the supplied instance config and apply target status."""
+    instance_obj = cast(Any, instance)
+    user_obj = cast(Any, user)
+    container_info = container_manager.create_container(
+        username=str(user_obj.username),
+        gpu_indices=gpu_indices,
+        memory_gb=memory_gb,
+        cpu_cores=cpu_cores,
+        image_name=image_name,
+        container_name=str(instance_obj.container_name),
+        workspace_dir=workspace_dir,
+        authorized_keys=_get_user_authorized_keys(db, int(user_obj.id)),
+    )
+    instance_obj.container_id = str(container_info["container_id"])
+    instance_obj.ssh_port = int(container_info["ssh_port"])
+    instance_obj.ssh_password = str(container_info["ssh_password"])
+    instance_obj.gpu_indices = list(gpu_indices)
+    instance_obj.memory_gb = memory_gb
+    instance_obj.cpu_cores = cpu_cores
+    if running:
+        _add_gpu_allocations(db, int(instance_obj.id), gpu_indices)
+        instance_obj.status = "running"
+        instance_obj.stopped_at = None
+        return
+
+    container_manager.stop_container(str(instance_obj.container_name))
+    gpu_manager.release(str(instance_obj.container_name), db)
+    instance_obj.status = "stopped"
+    instance_obj.stopped_at = stopped_at or datetime.utcnow()
+
+
+def _rebuild_instance_in_place(
+    instance: Instance,
+    *,
+    new_memory_gb: int,
+) -> Instance:
+    """Apply a memory-only config change without recreating the container."""
+    instance_obj = cast(Any, instance)
+    current_gpu_count = len(list(instance_obj.gpu_indices))
+    new_cpu_cores = max(4, current_gpu_count * 8)
+    container_manager.update_container_resources(
+        str(instance_obj.container_name),
+        memory_gb=new_memory_gb,
+        cpu_cores=new_cpu_cores,
+    )
+    instance_obj.memory_gb = new_memory_gb
+    instance_obj.cpu_cores = new_cpu_cores
+    return instance
+
+
 def _rebuild_instance_with_new_gpus(
     db: Session,
     instance: Instance,
@@ -371,71 +486,147 @@ def _rebuild_instance_with_new_gpus(
     new_gpu_indices: list[int],
     new_memory_gb: int,
 ) -> Instance:
-    """Rebuild an instance after config changes with backup protection."""
+    """Rebuild an instance after a GPU config change using one fresh environment snapshot."""
     instance_obj = cast(Any, instance)
     user_obj = cast(Any, user)
+    container_name = str(instance_obj.container_name)
+    original_status = str(instance_obj.status)
+    original_stopped_at = instance_obj.stopped_at
+    original_runtime_image = _runtime_image_for_instance(instance)
+    original_snapshot_image = (
+        str(instance_obj.last_snapshot_image_name)
+        if instance_obj.last_snapshot_image_name
+        else None
+    )
+    original_snapshot_at = instance_obj.last_snapshot_at
     original_gpu_indices = list(instance_obj.gpu_indices)
     original_memory_gb = int(instance_obj.memory_gb)
     original_cpu_cores = int(instance_obj.cpu_cores)
+    original_running = original_status == "running"
+    new_runtime_image: str | None = None
     source_workspace = container_manager.locate_instance_workspace_dir(
-        str(user_obj.username), str(instance_obj.container_name)
+        str(user_obj.username), container_name
     )
     backup_path = source_workspace.parent / _unique_name(f"{user_obj.username}_backup")
     target_workspace = container_manager.get_instance_workspace_dir(
-        str(user_obj.username), str(instance_obj.container_name), create=False
+        str(user_obj.username), container_name, create=False
     )
 
     container_manager.create_workspace_backup(source_workspace, backup_path)
 
     try:
-        container_manager.remove_container(str(instance_obj.container_name))
-    except RuntimeError as exc:
-        if "not found" not in str(exc).lower():
-            raise
+        if original_running:
+            container_manager.stop_container(container_name)
+        instance_obj.snapshot_status = "creating"
+        new_runtime_image = container_manager.snapshot_container(container_name)
+        instance_obj.last_snapshot_image_name = new_runtime_image
+        instance_obj.last_snapshot_at = datetime.utcnow()
+        instance_obj.snapshot_status = "ready"
+        instance_obj.runtime_image_name = new_runtime_image
+        db.flush()
+    except Exception as exc:
+        instance_obj.snapshot_status = "failed"
+        instance_obj.runtime_image_name = original_runtime_image
+        instance_obj.last_snapshot_image_name = original_snapshot_image
+        instance_obj.last_snapshot_at = original_snapshot_at
+        if original_running:
+            try:
+                container_manager.restart_container(container_name)
+            except RuntimeError as restart_exc:
+                instance_obj.status = "error"
+                LOGGER.exception(
+                    "Failed to restore running state after snapshot failure for %s",
+                    container_name,
+                )
+                raise RuntimeError(
+                    f"Failed to snapshot instance {container_name} and restart the original container."
+                ) from restart_exc
+        instance_obj.status = original_status
+        instance_obj.stopped_at = original_stopped_at
+        LOGGER.exception("Failed to snapshot instance %s: %s", container_name, exc)
+        raise RuntimeError(
+            f"Failed to snapshot instance {container_name}; original container was kept."
+        ) from exc
 
-    gpu_manager.release(str(instance_obj.container_name), db)
+    try:
+        container_manager.remove_container(container_name)
+    except RuntimeError as exc:
+        instance_obj.runtime_image_name = original_runtime_image
+        if original_running:
+            try:
+                container_manager.restart_container(container_name)
+            except RuntimeError:
+                instance_obj.status = "error"
+        instance_obj.status = original_status
+        instance_obj.stopped_at = original_stopped_at
+        raise RuntimeError(
+            f"Failed to remove original container {container_name}: {exc}"
+        ) from exc
+
+    gpu_manager.release(container_name, db)
 
     try:
         container_manager.remove_workspace(target_workspace)
         container_manager.copy_workspace(backup_path, target_workspace)
-        instance_obj.gpu_indices = list(new_gpu_indices)
-        instance_obj.memory_gb = new_memory_gb
-        instance_obj.cpu_cores = max(4, len(new_gpu_indices) * 8)
-        for gpu_index in new_gpu_indices:
-            db.add(GPUAllocation(gpu_index=gpu_index, instance_id=instance_obj.id))
-        db.flush()
-        container_info = container_manager.create_container(
-            username=str(user_obj.username),
-            gpu_indices=new_gpu_indices,
+        _restore_instance_container(
+            db,
+            instance,
+            user,
+            image_name=str(new_runtime_image),
+            gpu_indices=list(new_gpu_indices),
             memory_gb=new_memory_gb,
             cpu_cores=max(4, len(new_gpu_indices) * 8),
-            image_name=str(instance_obj.image_name),
-            container_name=str(instance_obj.container_name),
             workspace_dir=target_workspace,
-            authorized_keys=_get_user_authorized_keys(db, int(user_obj.id)),
+            running=False,
+            stopped_at=datetime.utcnow(),
         )
-        instance_obj.container_id = str(container_info["container_id"])
-        instance_obj.ssh_port = int(container_info["ssh_port"])
-        instance_obj.ssh_password = str(container_info["ssh_password"])
-        instance_obj.status = "running"
-        instance_obj.stopped_at = None
         _schedule_backup_cleanup(backup_path)
+        for image_ref in {original_runtime_image, original_snapshot_image}:
+            if image_ref and image_ref != new_runtime_image:
+                _cleanup_snapshot_image_if_unused(
+                    db,
+                    image_ref,
+                    exclude_instance_id=int(instance_obj.id),
+                )
         return instance
     except Exception as exc:
         try:
-            container_manager.remove_container(str(instance_obj.container_name))
+            container_manager.remove_container(container_name)
         except RuntimeError:
             pass
         container_manager.restore_workspace_backup(backup_path, target_workspace)
-        instance_obj.gpu_indices = original_gpu_indices
-        instance_obj.memory_gb = original_memory_gb
-        instance_obj.cpu_cores = original_cpu_cores
-        instance_obj.status = "error"
-        LOGGER.exception(
-            "Failed to rebuild instance %s: %s", instance_obj.container_name, exc
-        )
+        try:
+            _restore_instance_container(
+                db,
+                instance,
+                user,
+                image_name=str(new_runtime_image),
+                gpu_indices=original_gpu_indices,
+                memory_gb=original_memory_gb,
+                cpu_cores=original_cpu_cores,
+                workspace_dir=target_workspace,
+                running=original_running,
+                stopped_at=original_stopped_at,
+            )
+            _schedule_backup_cleanup(backup_path)
+        except Exception as rollback_exc:
+            instance_obj.gpu_indices = original_gpu_indices
+            instance_obj.memory_gb = original_memory_gb
+            instance_obj.cpu_cores = original_cpu_cores
+            instance_obj.status = "error"
+            instance_obj.stopped_at = datetime.utcnow()
+            LOGGER.exception(
+                "Failed to rollback instance %s after rebuild error: %s",
+                container_name,
+                rollback_exc,
+            )
+            raise RuntimeError(
+                f"Failed to rebuild instance {container_name}; automatic rollback also failed."
+            ) from rollback_exc
+
+        LOGGER.exception("Failed to rebuild instance %s: %s", container_name, exc)
         raise RuntimeError(
-            f"Failed to rebuild instance {instance_obj.container_name}; original data was restored from backup."
+            f"Failed to rebuild instance {container_name}; the original config was restored from the latest snapshot."
         ) from exc
 
 
@@ -694,9 +885,6 @@ def create_instance(
     workspace_path = container_manager.get_instance_workspace_dir(
         str(current_user_obj.username), container_name
     )
-    persistent_python_path = container_manager.get_instance_persistent_python_dir(
-        str(current_user_obj.username), container_name
-    )
     container_created = False
 
     with gpu_manager.locked_allocation():
@@ -728,14 +916,14 @@ def create_instance(
                 memory_gb=payload.memory_gb,
                 cpu_cores=cpu_cores,
                 image_name=resolved_image_ref,
+                base_image_name=resolved_image_ref,
+                runtime_image_name=resolved_image_ref,
+                snapshot_status="none",
                 status="error",
                 expire_at=expire_at,
             )
             db.add(instance)
             db.flush()
-
-            for gpu_index in selected_gpus:
-                db.add(GPUAllocation(gpu_index=gpu_index, instance_id=instance.id))
 
             container_info = container_manager.create_container(
                 username=str(current_user_obj.username),
@@ -745,7 +933,6 @@ def create_instance(
                 image_name=resolved_image_ref,
                 container_name=container_name,
                 workspace_dir=workspace_path,
-                persistent_python_dir=persistent_python_path,
                 authorized_keys=_get_user_authorized_keys(db, int(current_user_obj.id)),
             )
             container_created = True
@@ -754,6 +941,7 @@ def create_instance(
             instance_obj.ssh_port = int(container_info["ssh_port"])
             instance_obj.ssh_password = str(container_info["ssh_password"])
             instance_obj.status = "running"
+            _add_gpu_allocations(db, int(instance.id), selected_gpus)
             LOGGER.info(
                 "Created instance %s for user %s",
                 instance_obj.container_name,
@@ -768,7 +956,7 @@ def create_instance(
                     container_manager.remove_container(container_name)
                 except RuntimeError:
                     pass
-            _cleanup_instance_storage_dirs(workspace_path, persistent_python_path)
+            _cleanup_instance_storage_dirs(workspace_path)
             db.rollback()
             raise
         except ValueError as exc:
@@ -777,7 +965,7 @@ def create_instance(
                     container_manager.remove_container(container_name)
                 except RuntimeError:
                     pass
-            _cleanup_instance_storage_dirs(workspace_path, persistent_python_path)
+            _cleanup_instance_storage_dirs(workspace_path)
             db.rollback()
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
@@ -786,7 +974,7 @@ def create_instance(
                     container_manager.remove_container(container_name)
                 except RuntimeError:
                     pass
-            _cleanup_instance_storage_dirs(workspace_path, persistent_python_path)
+            _cleanup_instance_storage_dirs(workspace_path)
             db.rollback()
             status_code = 503 if "Unable to connect to Docker" in str(exc) else 500
             raise HTTPException(status_code=status_code, detail=str(exc)) from exc
@@ -796,7 +984,7 @@ def create_instance(
                     container_manager.remove_container(container_name)
                 except RuntimeError:
                     pass
-            _cleanup_instance_storage_dirs(workspace_path, persistent_python_path)
+            _cleanup_instance_storage_dirs(workspace_path)
             db.rollback()
             raise HTTPException(
                 status_code=500, detail=f"Failed to create instance: {exc}"
@@ -930,7 +1118,7 @@ def rebuild_instance(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Rebuild an instance after changing GPU count or memory, with backup protection."""
+    """Update memory in place or rebuild one instance after a GPU config change."""
     if payload.num_gpus not in {0, 1, 2, 4, 8}:
         raise HTTPException(
             status_code=400,
@@ -958,22 +1146,30 @@ def rebuild_instance(
     current_user_obj = cast(Any, current_user)
     current_gpu_count = len(list(instance_obj.gpu_indices))
     current_memory_gb = int(instance_obj.memory_gb)
+    current_is_running = _instance_is_running(instance)
     if payload.num_gpus == current_gpu_count and payload.memory_gb == current_memory_gb:
         raise HTTPException(status_code=400, detail="Configuration is unchanged.")
 
     db.refresh(current_user)
     usage = _get_running_usage(current_user)
-    projected_gpu_usage = usage["used_gpu"] - current_gpu_count + payload.num_gpus
+    current_usage_gpu = current_gpu_count if current_is_running else 0
+    current_usage_memory = current_memory_gb if current_is_running else 0
+    target_running = current_is_running if payload.num_gpus == current_gpu_count else True
+    target_usage_gpu = payload.num_gpus if target_running else 0
+    target_usage_memory = payload.memory_gb if target_running else 0
+    projected_gpu_usage = usage["used_gpu"] - current_usage_gpu + target_usage_gpu
     if projected_gpu_usage > int(current_user_obj.quota_gpu):
         raise HTTPException(status_code=400, detail="GPU quota exceeded.")
     projected_memory_usage = (
-        usage["used_memory_gb"] - current_memory_gb + payload.memory_gb
+        usage["used_memory_gb"] - current_usage_memory + target_usage_memory
     )
     if projected_memory_usage > int(current_user_obj.quota_memory_gb):
         raise HTTPException(status_code=400, detail="Memory quota exceeded.")
 
     node_running_memory_gb = _get_node_running_memory_gb(db)
-    projected_node_memory_gb = node_running_memory_gb - current_memory_gb + payload.memory_gb
+    projected_node_memory_gb = (
+        node_running_memory_gb - current_usage_memory + target_usage_memory
+    )
     if projected_node_memory_gb > NODE_ALLOCATABLE_MEMORY_GB:
         raise HTTPException(
             status_code=400,
@@ -986,21 +1182,33 @@ def rebuild_instance(
 
     with gpu_manager.locked_allocation():
         try:
-            selected_gpus = _choose_rebuild_gpu_indices(db, instance, payload.num_gpus)
-            rebuilt_instance = _rebuild_instance_with_new_gpus(
-                db,
-                instance,
-                current_user,
-                selected_gpus,
-                payload.memory_gb,
-            )
-            LOGGER.info(
-                "Rebuilt instance %s for user %s with GPUs %s and memory %sGB",
-                instance_obj.container_name,
-                current_user_obj.username,
-                selected_gpus,
-                payload.memory_gb,
-            )
+            if payload.num_gpus == current_gpu_count:
+                rebuilt_instance = _rebuild_instance_in_place(
+                    instance,
+                    new_memory_gb=payload.memory_gb,
+                )
+                LOGGER.info(
+                    "Updated instance %s in place for user %s with memory %sGB",
+                    instance_obj.container_name,
+                    current_user_obj.username,
+                    payload.memory_gb,
+                )
+            else:
+                selected_gpus = _choose_rebuild_gpu_indices(db, instance, payload.num_gpus)
+                rebuilt_instance = _rebuild_instance_with_new_gpus(
+                    db,
+                    instance,
+                    current_user,
+                    selected_gpus,
+                    payload.memory_gb,
+                )
+                LOGGER.info(
+                    "Rebuilt instance %s for user %s with GPUs %s and memory %sGB",
+                    instance_obj.container_name,
+                    current_user_obj.username,
+                    selected_gpus,
+                    payload.memory_gb,
+                )
             db.commit()
             db.refresh(rebuilt_instance)
             return _serialize_instance(rebuilt_instance)

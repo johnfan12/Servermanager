@@ -72,6 +72,11 @@ class Instance(Base):
     ssh_password = Column(String(64), nullable=True)
     vps_access = Column(JSON, nullable=True)  # VPS 访问信息: {vps_port, vps_ip, ssh_cmd}
     image_name = Column(String(128), nullable=False)
+    base_image_name = Column(String(255), nullable=True)
+    runtime_image_name = Column(String(255), nullable=True)
+    last_snapshot_image_name = Column(String(255), nullable=True)
+    last_snapshot_at = Column(DateTime, nullable=True)
+    snapshot_status = Column(String(32), nullable=False, default="none")
     status = Column(String(32), nullable=False, default="stopped")
     last_billing_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
