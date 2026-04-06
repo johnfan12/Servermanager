@@ -79,6 +79,11 @@ def _normalize_display_name(value: str | None) -> str | None:
     return normalized
 
 
+def _is_selectable_base_image(image_ref: str | None) -> bool:
+    """Return whether an image may be selected as a new instance base image."""
+    return not container_manager.is_snapshot_image(image_ref)
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     """Initialize and tear down persistent services around app lifetime."""
@@ -700,7 +705,7 @@ def get_meta(db: Session = Depends(get_db)) -> dict[str, Any]:
 
 @app.get("/api/images")
 def get_images() -> dict[str, Any]:
-    """Return image options for create/rebuild UI.
+    """Return base image options for create UI.
 
     key: 前端提交到创建接口的镜像键
     label: 展示名称
@@ -718,6 +723,7 @@ def get_images() -> dict[str, Any]:
             "image_ref": image["image_ref"],
         }
         for image in local_images
+        if _is_selectable_base_image(image["image_ref"])
     ]
     return {"images": images}
 
@@ -843,6 +849,11 @@ def create_instance(
         resolved_image_ref = container_manager.ensure_image_available(payload.image)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not _is_selectable_base_image(resolved_image_ref):
+        raise HTTPException(
+            status_code=400,
+            detail="Managed snapshot images cannot be selected as base images.",
+        )
     normalized_display_name = _normalize_display_name(payload.display_name)
 
     db.refresh(current_user)
