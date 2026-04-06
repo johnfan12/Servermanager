@@ -57,6 +57,10 @@ LOGGER = logging.getLogger(__name__)
 DISPLAY_NAME_MAX_LENGTH = 64
 
 
+class InstanceStateChangedError(RuntimeError):
+    """Raised after container state changed and DB state should be preserved."""
+
+
 def _unique_name(prefix: str) -> str:
     """Return a collision-resistant resource name."""
     return f"{prefix}_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{secrets.token_hex(3)}"
@@ -320,6 +324,17 @@ def _add_gpu_allocations(db: Session, instance_id: int, gpu_indices: list[int]) 
     """Insert GPU allocation rows for one instance."""
     for gpu_index in gpu_indices:
         db.add(GPUAllocation(gpu_index=gpu_index, instance_id=instance_id))
+
+
+def _get_instance_allocated_gpu_indices(db: Session, instance: Instance) -> set[int]:
+    """Return GPU indices currently allocated to this instance."""
+    instance_obj = cast(Any, instance)
+    return {
+        int(allocation.gpu_index)
+        for allocation in db.query(GPUAllocation)
+        .filter(GPUAllocation.instance_id == instance_obj.id)
+        .all()
+    }
 
 
 def _cleanup_snapshot_image_if_unused(
@@ -635,12 +650,14 @@ def _rebuild_instance_with_new_gpus(
         ) from exc
 
 
-def _choose_rebuild_gpu_indices(
+def _choose_instance_gpu_indices(
     db: Session,
     instance: Instance,
     requested_gpu_count: int,
+    *,
+    insufficient_detail: str,
 ) -> list[int]:
-    """Choose GPUs for an instance rebuild, preferring current assignments."""
+    """Choose GPUs for an instance action, preferring reusable current GPUs."""
     instance_obj = cast(Any, instance)
     current_gpu_indices = [
         int(gpu_index) for gpu_index in list(instance_obj.gpu_indices)
@@ -648,6 +665,7 @@ def _choose_rebuild_gpu_indices(
     if requested_gpu_count == 0:
         return []
 
+    owned_allocated_gpus = _get_instance_allocated_gpu_indices(db, instance)
     statuses = gpu_manager.get_gpu_status(db)
     status_map: dict[int, dict[str, Any]] = {}
     for status in statuses:
@@ -655,9 +673,14 @@ def _choose_rebuild_gpu_indices(
         if isinstance(gpu_index, int):
             status_map[gpu_index] = status
 
-    reusable = [
-        gpu_index for gpu_index in current_gpu_indices if gpu_index in status_map
-    ]
+    reusable: list[int] = []
+    for gpu_index in current_gpu_indices:
+        if gpu_index not in status_map or gpu_index in reusable:
+            continue
+        status = status_map[gpu_index]
+        if gpu_index in owned_allocated_gpus or bool(status.get("is_idle")):
+            reusable.append(gpu_index)
+
     selected = reusable[:requested_gpu_count]
     if len(selected) == requested_gpu_count:
         return selected
@@ -671,10 +694,155 @@ def _choose_rebuild_gpu_indices(
     if len(idle_candidates) < needed:
         raise HTTPException(
             status_code=400,
-            detail="Not enough available GPUs to rebuild this instance.",
+            detail=insufficient_detail,
         )
     selected.extend(idle_candidates[:needed])
     return selected
+
+
+def _choose_rebuild_gpu_indices(
+    db: Session,
+    instance: Instance,
+    requested_gpu_count: int,
+) -> list[int]:
+    """Choose GPUs for an instance rebuild, preferring current assignments."""
+    return _choose_instance_gpu_indices(
+        db,
+        instance,
+        requested_gpu_count,
+        insufficient_detail="Not enough available GPUs to rebuild this instance.",
+    )
+
+
+def _restart_instance_with_reassigned_gpus(
+    db: Session,
+    instance: Instance,
+    user: User,
+    new_gpu_indices: list[int],
+) -> Instance:
+    """Restart a stopped instance by recreating its container on newly selected GPUs."""
+    instance_obj = cast(Any, instance)
+    user_obj = cast(Any, user)
+    container_name = str(instance_obj.container_name)
+    original_runtime_image = _runtime_image_for_instance(instance)
+    original_snapshot_image = (
+        str(instance_obj.last_snapshot_image_name)
+        if instance_obj.last_snapshot_image_name
+        else None
+    )
+    original_snapshot_at = instance_obj.last_snapshot_at
+    original_gpu_indices = list(instance_obj.gpu_indices)
+    original_memory_gb = int(instance_obj.memory_gb)
+    original_cpu_cores = int(instance_obj.cpu_cores)
+    workspace_dir = container_manager.locate_instance_workspace_dir(
+        str(user_obj.username), container_name
+    )
+    new_runtime_image: str | None = None
+
+    try:
+        instance_obj.snapshot_status = "creating"
+        db.flush()
+        new_runtime_image = container_manager.snapshot_container(container_name)
+        instance_obj.last_snapshot_image_name = new_runtime_image
+        instance_obj.last_snapshot_at = datetime.utcnow()
+        instance_obj.snapshot_status = "ready"
+        instance_obj.runtime_image_name = new_runtime_image
+        db.flush()
+    except Exception as exc:
+        instance_obj.snapshot_status = "failed"
+        instance_obj.runtime_image_name = original_runtime_image
+        instance_obj.last_snapshot_image_name = original_snapshot_image
+        instance_obj.last_snapshot_at = original_snapshot_at
+        raise RuntimeError(
+            f"Failed to snapshot instance {container_name}; original stopped container was kept."
+        ) from exc
+
+    try:
+        container_manager.remove_container(container_name)
+    except RuntimeError as exc:
+        instance_obj.runtime_image_name = original_runtime_image
+        instance_obj.last_snapshot_image_name = original_snapshot_image
+        instance_obj.last_snapshot_at = original_snapshot_at
+        instance_obj.snapshot_status = "ready" if original_snapshot_image else "none"
+        try:
+            container_manager.remove_image(str(new_runtime_image))
+        except RuntimeError as cleanup_exc:
+            LOGGER.warning(
+                "Failed to remove unused restart snapshot %s: %s",
+                new_runtime_image,
+                cleanup_exc,
+            )
+        raise RuntimeError(
+            f"Failed to remove original container {container_name}: {exc}"
+        ) from exc
+
+    gpu_manager.release(container_name, db)
+
+    try:
+        _restore_instance_container(
+            db,
+            instance,
+            user,
+            image_name=str(new_runtime_image),
+            gpu_indices=list(new_gpu_indices),
+            memory_gb=original_memory_gb,
+            cpu_cores=max(4, len(new_gpu_indices) * 8),
+            workspace_dir=workspace_dir,
+            running=True,
+            stopped_at=None,
+        )
+        for image_ref in {original_runtime_image, original_snapshot_image}:
+            if image_ref and image_ref != new_runtime_image:
+                _cleanup_snapshot_image_if_unused(
+                    db,
+                    image_ref,
+                    exclude_instance_id=int(instance_obj.id),
+                )
+        return instance
+    except Exception as exc:
+        try:
+            container_manager.remove_container(container_name)
+        except RuntimeError:
+            pass
+        try:
+            _restore_instance_container(
+                db,
+                instance,
+                user,
+                image_name=str(new_runtime_image),
+                gpu_indices=original_gpu_indices,
+                memory_gb=original_memory_gb,
+                cpu_cores=original_cpu_cores,
+                workspace_dir=workspace_dir,
+                running=False,
+                stopped_at=datetime.utcnow(),
+            )
+        except Exception as rollback_exc:
+            instance_obj.gpu_indices = original_gpu_indices
+            instance_obj.memory_gb = original_memory_gb
+            instance_obj.cpu_cores = original_cpu_cores
+            instance_obj.runtime_image_name = new_runtime_image
+            instance_obj.last_snapshot_image_name = new_runtime_image
+            instance_obj.snapshot_status = "failed"
+            instance_obj.status = "error"
+            instance_obj.stopped_at = datetime.utcnow()
+            LOGGER.exception(
+                "Failed to restore stopped instance %s after restart error: %s",
+                container_name,
+                rollback_exc,
+            )
+            raise InstanceStateChangedError(
+                f"Failed to restart instance {container_name}; automatic fallback also failed."
+            ) from rollback_exc
+
+        LOGGER.exception(
+            "Failed to restart instance %s with reassigned GPUs: %s",
+            container_name,
+            exc,
+        )
+        raise InstanceStateChangedError(
+            f"Failed to restart instance {container_name}; it was kept stopped on the latest snapshot."
+        ) from exc
 
 
 @app.get("/")
@@ -1041,7 +1209,7 @@ def restart_instance(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
-    """Restart a stopped instance after validating its GPU reservation."""
+    """Restart an instance after validating or reassigning its GPU reservation."""
     instance = _get_instance_for_user(db, instance_id, current_user)
     instance_obj = cast(Any, instance)
     expire_at = instance_obj.expire_at
@@ -1053,7 +1221,24 @@ def restart_instance(
 
     with gpu_manager.locked_allocation():
         try:
-            gpu_indices = list(instance_obj.gpu_indices)
+            current_gpu_indices = [
+                int(gpu_index) for gpu_index in list(instance_obj.gpu_indices)
+            ]
+            container_name = str(instance_obj.container_name)
+            if _instance_is_running(instance):
+                container_manager.restart_container(container_name)
+                instance_obj.status = "running"
+                instance_obj.stopped_at = None
+                db.commit()
+                return {"message": "Instance restarted."}
+
+            gpu_manager.release(container_name, db)
+            gpu_indices = _choose_instance_gpu_indices(
+                db,
+                instance,
+                len(current_gpu_indices),
+                insufficient_detail="Not enough available GPUs to restart this instance.",
+            )
             if gpu_indices:
                 gpu_manager.allocate(
                     current_user,
@@ -1062,6 +1247,22 @@ def restart_instance(
                     int(instance_obj.cpu_cores),
                     db,
                 )
+            if gpu_indices != current_gpu_indices:
+                _restart_instance_with_reassigned_gpus(
+                    db,
+                    instance,
+                    current_user,
+                    gpu_indices,
+                )
+                LOGGER.info(
+                    "Restarted instance %s for user %s with reassigned GPUs %s",
+                    container_name,
+                    cast(Any, current_user).username,
+                    gpu_indices,
+                )
+                db.commit()
+                return {"message": "Instance restarted."}
+
             for gpu_index in gpu_indices:
                 exists = (
                     db.query(GPUAllocation)
@@ -1075,10 +1276,16 @@ def restart_instance(
                     db.add(
                         GPUAllocation(gpu_index=gpu_index, instance_id=instance_obj.id)
                     )
-            container_manager.restart_container(str(instance_obj.container_name))
+            container_manager.restart_container(container_name)
             instance_obj.status = "running"
             instance_obj.stopped_at = None
             db.commit()
+        except HTTPException:
+            db.rollback()
+            raise
+        except InstanceStateChangedError as exc:
+            db.commit()
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         except ValueError as exc:
             db.rollback()
             raise HTTPException(status_code=400, detail=str(exc)) from exc
