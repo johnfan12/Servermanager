@@ -1,7 +1,10 @@
-FROM pytorch/pytorch:2.3.0-cuda12.1-cudnn8-runtime
+FROM nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Etc/UTC \
     PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
     HF_HOME=/root/.cache/huggingface \
     CUDA_HOME=/usr/local/cuda
 
@@ -10,8 +13,9 @@ ARG INSTALL_DEEPSPEED=0
 ARG INSTALL_XFORMERS=0
 ARG INSTALL_FLASH_ATTN=0
 
-# System tools + build toolchain for CUDA extensions
+# System tools + Python 3.11 + build toolchain for CUDA extensions
 RUN apt-get update && apt-get install -y \
+    software-properties-common \
     openssh-server \
     vim \
     git \
@@ -24,12 +28,26 @@ RUN apt-get update && apt-get install -y \
     ninja-build \
     cmake \
     pkg-config \
+    ca-certificates \
+    gnupg \
+    lsb-release \
     libopenblas-dev \
     libaio-dev \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update && apt-get install -y \
+    python3.11 \
+    python3.11-dev \
+    python3.11-venv \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python \
+    && ln -sf /usr/bin/python3.11 /usr/bin/python3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Core data science + HF + training stack
+# Install PyTorch (CUDA 12.8), then keep the extra "full" packages
 RUN python -m pip install --upgrade pip setuptools wheel && \
+    pip install \
+    torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu128 && \
     pip install \
     jupyterlab \
     ipywidgets \
@@ -80,6 +98,11 @@ RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/
     echo 'PubkeyAuthentication yes' >> /etc/ssh/sshd_config && \
     echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
 
-EXPOSE 22
+RUN python -c "import sys; print(sys.version)" && \
+    python -c "import torch; print('torch=', torch.__version__); print('cuda=', torch.version.cuda); print('cuda_available=', torch.cuda.is_available())"
+
+WORKDIR /workspace
+
+EXPOSE 22 8888
 
 CMD ["/usr/sbin/sshd", "-D"]

@@ -1,22 +1,22 @@
-# PyTorch 2.7 + CUDA 12.8 — 适用于 NVIDIA 50 系列 Blackwell GPU（SM 12.0）
-# 基础镜像来自 NVIDIA NGC，内含已针对 Blackwell 架构编译的 PyTorch
-# 需要宿主机 NVIDIA 驱动 >= 570.x
-# 对应 config.py 中的 "pytorch_blackwell" 键
-# 构建命令：docker build -t lab/pytorch:2.7-cuda12.8-blackwell -f docker/Dockerfile.pytorch_blackwell .
 #
-# 说明：
-#   nvcr.io/nvidia/pytorch:25.03-py3 包含：
-#     - CUDA 12.8.1
-#     - cuDNN 9.x
-#     - PyTorch 2.7.0a0（Blackwell SM 12.0 编译）
-#     - Ubuntu 24.04, Python 3.12
-#   如需更新版本，请访问：https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch
-
+# Blackwell variant:
+# - keep the NGC image so Blackwell-optimized PyTorch stays available
+# - align the rest of the installed stack with Dockerfile.pytorch
+#
 FROM nvcr.io/nvidia/pytorch:25.03-py3
 
-ENV DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive \
+    TZ=Etc/UTC \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/root/.cache/huggingface
 
 RUN apt-get update && apt-get install -y \
+    software-properties-common \
+    ca-certificates \
+    gnupg \
+    lsb-release \
     openssh-server \
     vim \
     git \
@@ -25,16 +25,61 @@ RUN apt-get update && apt-get install -y \
     htop \
     tmux \
     net-tools \
+    build-essential \
+    pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /var/run/sshd
+# Upgrade pip tooling
+RUN python -m pip install --upgrade pip setuptools wheel
 
-# 允许 root 通过密码登录（container_manager 会在启动后动态设置密码）
-RUN sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config \
+# PyTorch is already bundled in the NGC image; align the rest of the stack with Dockerfile.pytorch
+RUN pip install \
+    jupyterlab \
+    notebook \
+    ipywidgets \
+    numpy \
+    scipy \
+    pandas \
+    scikit-learn \
+    matplotlib \
+    seaborn \
+    tqdm \
+    pillow \
+    opencv-python-headless \
+    tensorboard \
+    einops \
+    safetensors \
+    sentencepiece \
+    transformers \
+    datasets \
+    huggingface_hub \
+    tokenizers \
+    accelerate \
+    peft \
+    evaluate \
+    timm \
+    xgboost \
+    lightgbm \
+    pyarrow \
+    pyyaml \
+    rich \
+    ipdb
+
+RUN pip install \
+    lightning \
+    deepspeed
+
+RUN mkdir -p /var/run/sshd && \
+    sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config \
     && echo 'PubkeyAuthentication yes' >> /etc/ssh/sshd_config \
     && echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
 
-# NGC 镜像默认 CMD 会启动 Jupyter，此处覆盖为 sshd
-EXPOSE 22
+# Self-check during build
+RUN python -c "import sys; print(sys.version)" && \
+    python -c "import torch; print('torch=', torch.__version__); print('cuda=', torch.version.cuda); print('cuda_available=', torch.cuda.is_available())"
+
+WORKDIR /workspace
+
+EXPOSE 22 8888
 
 CMD ["/usr/sbin/sshd", "-D"]
