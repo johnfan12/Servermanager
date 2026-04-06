@@ -12,7 +12,6 @@ from typing import Any, cast
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import or_
 from sqlalchemy.exc import IntegrityError
@@ -673,9 +672,13 @@ def _choose_rebuild_gpu_indices(
 
 
 @app.get("/")
-def index() -> FileResponse:
-    """Serve the single-file management UI."""
-    return FileResponse(Path("static") / "index.html")
+def index() -> dict[str, str]:
+    """Return a minimal service description instead of a node-local frontend."""
+    return {
+        "service": "Servermanager",
+        "role": "node-backend",
+        "message": "Node frontend has been removed. Use Clustermanager as the web console.",
+    }
 
 
 @app.get("/api/meta")

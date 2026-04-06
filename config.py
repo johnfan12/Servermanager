@@ -148,7 +148,8 @@ FRP_SERVER_ADDR = os.environ.get("FRP_SERVER_ADDR", "your-vps-public-ip")
 FRP_SERVER_PORT = int(os.environ.get("FRP_SERVER_PORT", "7000"))
 FRP_TOKEN = os.environ.get("FRP_TOKEN", "your-frp-secret-token")
 FRP_CONFIG_DIR = Path(os.environ.get("FRP_CONFIG_DIR", "/etc/frp"))
-FRP_CONFIG_FILE = FRP_CONFIG_DIR / "frpc-containers.ini"
+# Legacy aggregate-mode config is only kept for migration cleanup.
+LEGACY_FRP_CONFIG_FILE = FRP_CONFIG_DIR / "frpc-containers.ini"
 FRP_API_ENABLED = os.environ.get("FRP_API_ENABLED", "true").lower() == "true"
 FRP_API_REMOTE_PORT = int(os.environ.get("FRP_API_REMOTE_PORT", "18881"))
 FRP_API_LOCAL_PORT = int(

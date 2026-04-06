@@ -18,7 +18,6 @@ from config import (
     FRP_API_LOCAL_PORT,
     FRP_API_PROXY_NAME,
     FRP_API_REMOTE_PORT,
-    FRP_CONFIG_FILE,
     FRP_CONFIG_DIR,
     FRP_CONTAINER_CONFIG_DIR,
     FRP_CONTAINER_SK_PREFIX,
@@ -26,6 +25,7 @@ from config import (
     FRP_SERVER_ADDR,
     FRP_SERVER_PORT,
     FRP_TOKEN,
+    LEGACY_FRP_CONFIG_FILE,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -223,7 +223,9 @@ class FrpManager:
         if containers:
             return containers
 
-        legacy_file = Path(FRP_CONFIG_FILE)
+        # Migration-only fallback for nodes that still have the removed
+        # aggregate-mode frpc-containers.ini on disk.
+        legacy_file = Path(LEGACY_FRP_CONFIG_FILE)
         if legacy_file.exists():
             try:
                 legacy_cfg = configparser.ConfigParser()
@@ -246,7 +248,7 @@ class FrpManager:
         if not container_names:
             return True
 
-        legacy_file = Path(FRP_CONFIG_FILE)
+        legacy_file = Path(LEGACY_FRP_CONFIG_FILE)
         if not legacy_file.exists():
             return True
 

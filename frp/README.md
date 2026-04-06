@@ -22,11 +22,11 @@ Servermanager 使用 FRP 的 **stcp（secret TCP）** 模式将容器 SSH 端口
 
 ## 组件
 
-### 1. frpc-containers（Servermanager 本地）
+### 1. frpc-container@<container>（Servermanager 本地）
 
-- **配置文件**: `/etc/frp/frpc-containers.ini`
-- **功能**: 为每个运行的容器创建 stcp 隧道
-- **触发方式**: 容器创建/删除时自动更新
+- **配置文件**: `/etc/frp/containers/<container>.ini`
+- **功能**: 为每个运行中的容器维护独立 stcp 隧道
+- **触发方式**: 容器创建/删除时由 Servermanager 自动增删和启停
 
 ### 2. frpc-visitors（VPS 上）
 
@@ -47,9 +47,9 @@ sudo cp frp_0.58.1_linux_amd64/frpc /usr/local/bin/
 
 2. **创建 systemd 服务**:
 ```bash
-sudo cp frp/frpc-containers.service /etc/systemd/system/
+sudo cp frp/frpc-container@.service /etc/systemd/system/
+sudo cp frp/frpc-api.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable frpc-containers
 ```
 
 3. **配置环境变量**（在 `start.sh` 或 systemd 中）:
@@ -62,9 +62,12 @@ export FRP_TOKEN="your-frp-secret-token"
 
 4. **启动服务**:
 ```bash
-sudo systemctl start frpc-containers
-python main.py  # 或启动你的服务
+sudo systemctl enable frpc-api
+sudo systemctl start frpc-api
+./start.sh
 ```
+
+说明：实例 SSH 隧道不需要手工启 `frpc-container@...`，Servermanager 会在实例创建、删除和同步时自动管理。
 
 ### Clustermanager（VPS）
 
@@ -116,8 +119,10 @@ sudo systemctl start frpc-visitors
 
 ```bash
 # Servermanager
-sudo systemctl status frpc-containers
-sudo journalctl -u frpc-containers -f
+sudo systemctl status "frpc-container@<container>.service"
+sudo journalctl -u "frpc-container@<container>.service" -f
+sudo systemctl status frpc-api
+sudo journalctl -u frpc-api -f
 
 # VPS
 sudo systemctl status frpc-visitors
@@ -128,11 +133,20 @@ sudo journalctl -u frpc-visitors -f
 
 ```bash
 # Servermanager
-cat /etc/frp/frpc-containers.ini
+ls /etc/frp/containers
+cat /etc/frp/containers/<container>.ini
 
 # VPS
 cat /etc/frp/frpc-visitors.ini
 ```
+
+### 旧模式清理
+
+旧版聚合模式使用 `/etc/frp/frpc-containers.ini` + `frpc-containers.service`。
+
+- 新部署不再使用该模式
+- `frp/install.sh` 会尝试停用并删除旧服务文件
+- `Servermanager` 仍会在迁移期间读取 legacy 配置并清理旧 section，避免 ghost recovery
 
 ### 测试连接
 

@@ -28,10 +28,16 @@ rm -rf "frp_${FRP_VERSION}_${FRP_ARCH}"
 sudo mkdir -p /etc/frp
 sudo mkdir -p /etc/frp/containers
 
-# 安装 systemd 服务
-sudo cp "${SCRIPT_DIR}/frpc-containers.service" /etc/systemd/system/
+# 安装 systemd 服务（per-container 模式）
 sudo cp "${SCRIPT_DIR}/frpc-container@.service" /etc/systemd/system/
 sudo cp "${SCRIPT_DIR}/frpc-api.service" /etc/systemd/system/
+
+# 清理旧聚合模式服务，避免新部署或升级后误启
+if sudo test -f /etc/systemd/system/frpc-containers.service; then
+  sudo systemctl stop frpc-containers.service 2>/dev/null || true
+  sudo systemctl disable frpc-containers.service 2>/dev/null || true
+  sudo rm -f /etc/systemd/system/frpc-containers.service
+fi
 
 # 重新加载 systemd
 sudo systemctl daemon-reload
@@ -48,7 +54,7 @@ echo "   sudo systemctl start frpc-api"
 echo ""
 echo "3. Container SSH tunnels now run in per-instance mode via"
 echo "   frpc-container@<container>.service, managed automatically by Servermanager."
-echo "   Do NOT keep legacy frpc-containers service running in parallel."
+echo "   Legacy frpc-containers aggregate mode has been retired and will be cleaned up."
 echo ""
 echo "4. Starting Servermanager will now sync /etc/frp/frpc-api.ini from .env"
 echo "   and restart frpc-api automatically when the token/port changes."

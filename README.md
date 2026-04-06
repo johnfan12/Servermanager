@@ -1,15 +1,21 @@
-# GPU Server Manager
+# Servermanager Node API
 
-轻量级单节点 GPU 实例管理服务（FastAPI + Docker + PostgreSQL）。
+轻量级单节点 GPU 实例管理后端（FastAPI + Docker + PostgreSQL）。
 
 ## 核心功能
 
-- 用户登录/注册与 JWT 鉴权
+- JWT 鉴权与节点 API
 - 按配额创建 GPU 容器实例（镜像、GPU 数、内存、到期时间）
 - 实例管理：查看、停止、重启、删除、日志
 - GPU 状态与配额统计
 - FRP 容器隧道（每实例独立 `frpc-container@<container>.service`）
 - 节点 API 穿透（`frpc-api`，供 Clustermanager 调用）
+
+## 当前定位
+
+- `Clustermanager` 是唯一正式 Web 前端
+- `Servermanager` 仅提供节点侧 API 与执行能力
+- 根路径 `/` 不再提供管理页面，只返回最小服务说明
 
 ## 快速启动
 
@@ -122,6 +128,8 @@ chmod +x start.sh
 
 默认服务地址：`http://127.0.0.1:18881`
 
+说明：该地址现在默认提供 API 服务与最小服务说明，不再提供节点本地管理前端。
+
 `start.sh` 会先执行 `alembic upgrade head`，然后再启动 `uvicorn`。
 
 ### 构建即开即用 PyTorch + HuggingFace 镜像
@@ -203,7 +211,8 @@ curl -s http://127.0.0.1:18881/api/auth/login \
 - 确认你已切换到 per-instance 模式：
   - 节点侧使用 `frpc-container@*.service`
   - VPS 侧使用 `frpc-visitor@*.service`
-- 避免并行运行 legacy `frpc-containers` / `frpc-visitors` 全局服务。
+- 若节点上仍残留 `frpc-containers.service`，请停用并删除，只保留 `frpc-container@*.service`。
+- VPS 侧同样不要并行运行旧的聚合 visitor 服务。
 
 ## 相关文件
 
