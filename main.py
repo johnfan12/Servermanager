@@ -174,14 +174,15 @@ class InstanceCreateRequest(BaseModel):
     num_gpus: int = Field(ge=0)
     memory_gb: int = Field(ge=8)
     image: str
-    expire_hours: int = Field(ge=24, le=168)
+    expire_hours: int = Field(ge=1, le=168)
     display_name: str | None = Field(default=None, max_length=128)
 
 
 class InstanceRenewRequest(BaseModel):
     """Request body for extending an instance expiration time."""
 
-    extend_days: int = Field(ge=1, le=7)
+    extend_hours: int | None = Field(default=None, ge=1, le=168)
+    extend_days: int | None = Field(default=None, ge=1, le=7)
 
 
 class QuotaUpdateRequest(BaseModel):
@@ -842,10 +843,6 @@ def create_instance(
         resolved_image_ref = container_manager.ensure_image_available(payload.image)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if payload.expire_hours % 24 != 0:
-        raise HTTPException(
-            status_code=400, detail="Expiration must be in full-day increments."
-        )
     normalized_display_name = _normalize_display_name(payload.display_name)
 
     db.refresh(current_user)
@@ -1104,8 +1101,17 @@ def renew_instance(
             detail="Renewal is only allowed when less than 7 days remain.",
         )
 
+    extend_hours = payload.extend_hours
+    if extend_hours is None and payload.extend_days is not None:
+        extend_hours = payload.extend_days * 24
+    if extend_hours is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Renewal requires extend_hours or extend_days.",
+        )
+
     base_time = expire_at if expire_at > now else now
-    instance_obj.expire_at = base_time + timedelta(days=payload.extend_days)
+    instance_obj.expire_at = base_time + timedelta(hours=extend_hours)
     db.commit()
     db.refresh(instance)
     return {
