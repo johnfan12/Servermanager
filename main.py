@@ -55,6 +55,7 @@ logging.basicConfig(
 )
 LOGGER = logging.getLogger(__name__)
 DISPLAY_NAME_MAX_LENGTH = 64
+CPU_ONLY_GPU_COUNT = 0
 
 
 class InstanceStateChangedError(RuntimeError):
@@ -86,6 +87,28 @@ def _normalize_display_name(value: str | None) -> str | None:
 def _is_selectable_base_image(image_ref: str | None) -> bool:
     """Return whether an image may be selected as a new instance base image."""
     return not container_manager.is_snapshot_image(image_ref)
+
+
+def _minimum_instance_memory_gb() -> int:
+    """Return the lowest configured instance memory option."""
+    return min(INSTANCE_MEMORY_OPTIONS_GB)
+
+
+def _is_cpu_only_min_memory(num_gpus: int, memory_gb: int) -> bool:
+    """Return whether a request qualifies for CPU-only minimum-memory fallback."""
+    return num_gpus == CPU_ONLY_GPU_COUNT and memory_gb == _minimum_instance_memory_gb()
+
+
+def _enforce_cpu_only_min_memory(num_gpus: int, memory_gb: int) -> None:
+    """Require CPU-only instances to use the lowest configured memory tier."""
+    if num_gpus == CPU_ONLY_GPU_COUNT and memory_gb != _minimum_instance_memory_gb():
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "CPU-only instances must use the minimum memory option: "
+                f"{_minimum_instance_memory_gb()} GB."
+            ),
+        )
 
 
 @asynccontextmanager
@@ -1013,6 +1036,7 @@ def create_instance(
             status_code=400,
             detail=f"Memory must be one of configured options: {allowed} GB.",
         )
+    _enforce_cpu_only_min_memory(payload.num_gpus, payload.memory_gb)
     try:
         resolved_image_ref = container_manager.ensure_image_available(payload.image)
     except RuntimeError as exc:
@@ -1037,7 +1061,10 @@ def create_instance(
 
     node_running_memory_gb = _get_node_running_memory_gb(db)
     projected_node_memory_gb = node_running_memory_gb + payload.memory_gb
-    if projected_node_memory_gb > NODE_ALLOCATABLE_MEMORY_GB:
+    if (
+        projected_node_memory_gb > NODE_ALLOCATABLE_MEMORY_GB
+        and not _is_cpu_only_min_memory(payload.num_gpus, payload.memory_gb)
+    ):
         raise HTTPException(
             status_code=400,
             detail=(
@@ -1367,6 +1394,7 @@ def rebuild_instance(
             status_code=400,
             detail=f"Memory must be one of configured options: {allowed} GB.",
         )
+    _enforce_cpu_only_min_memory(payload.num_gpus, payload.memory_gb)
 
     instance = _get_instance_for_user(db, instance_id, current_user)
     instance_obj = cast(Any, instance)
@@ -1397,7 +1425,10 @@ def rebuild_instance(
     projected_node_memory_gb = (
         node_running_memory_gb - current_usage_memory + target_usage_memory
     )
-    if projected_node_memory_gb > NODE_ALLOCATABLE_MEMORY_GB:
+    if (
+        projected_node_memory_gb > NODE_ALLOCATABLE_MEMORY_GB
+        and not _is_cpu_only_min_memory(payload.num_gpus, payload.memory_gb)
+    ):
         raise HTTPException(
             status_code=400,
             detail=(
