@@ -30,6 +30,7 @@ from config import (
     CORS_ALLOW_CREDENTIALS,
     CORS_ALLOW_ORIGINS,
     ENV,
+    GPU_COUNT,
     INSTANCE_MEMORY_OPTIONS_GB,
     INTERNAL_SERVICE_TOKEN,
     JWT_SECRET,
@@ -107,6 +108,31 @@ def _enforce_cpu_only_min_memory(num_gpus: int, memory_gb: int) -> None:
             detail=(
                 "CPU-only instances must use the minimum memory option: "
                 f"{_minimum_instance_memory_gb()} GB."
+            ),
+        )
+
+
+def _gpu_memory_limit_gb(num_gpus: int) -> float | None:
+    """Return the memory ceiling for a GPU-backed instance."""
+    if num_gpus <= CPU_ONLY_GPU_COUNT or GPU_COUNT <= 0:
+        return None
+    return NODE_ALLOCATABLE_MEMORY_GB * num_gpus / GPU_COUNT
+
+
+def _format_memory_limit(limit_gb: float) -> str:
+    """Format a memory limit for API error messages."""
+    return f"{limit_gb:.2f}".rstrip("0").rstrip(".")
+
+
+def _enforce_gpu_memory_limit(num_gpus: int, memory_gb: int) -> None:
+    """Limit memory by selected GPU share: num_gpus * total_memory / total_gpus."""
+    limit_gb = _gpu_memory_limit_gb(num_gpus)
+    if limit_gb is not None and memory_gb > limit_gb:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Memory cannot exceed {_format_memory_limit(limit_gb)} GB "
+                f"when selecting {num_gpus} GPU(s)."
             ),
         )
 
@@ -1037,6 +1063,7 @@ def create_instance(
             detail=f"Memory must be one of configured options: {allowed} GB.",
         )
     _enforce_cpu_only_min_memory(payload.num_gpus, payload.memory_gb)
+    _enforce_gpu_memory_limit(payload.num_gpus, payload.memory_gb)
     try:
         resolved_image_ref = container_manager.ensure_image_available(payload.image)
     except RuntimeError as exc:
@@ -1395,6 +1422,7 @@ def rebuild_instance(
             detail=f"Memory must be one of configured options: {allowed} GB.",
         )
     _enforce_cpu_only_min_memory(payload.num_gpus, payload.memory_gb)
+    _enforce_gpu_memory_limit(payload.num_gpus, payload.memory_gb)
 
     instance = _get_instance_for_user(db, instance_id, current_user)
     instance_obj = cast(Any, instance)
