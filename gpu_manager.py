@@ -16,8 +16,8 @@ from models import GPUAllocation, Instance, User
 
 LOGGER = logging.getLogger(__name__)
 
-GPUStat = dict[str, int | str]
-GPUStatus = dict[str, int | str | bool | None]
+GPUStat = dict[str, int | float | str | None]
+GPUStatus = dict[str, int | float | str | bool | None]
 
 
 class GPUManager:
@@ -35,11 +35,36 @@ class GPUManager:
         with self.lock:
             yield
 
+    @staticmethod
+    def _parse_nvidia_int(value: str) -> int | None:
+        """Parse one integer field from nvidia-smi, tolerating unsupported values."""
+        normalized = value.strip()
+        if not normalized or normalized.upper() == "N/A":
+            return None
+        try:
+            return int(float(normalized))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _parse_nvidia_float(value: str) -> float | None:
+        """Parse one float field from nvidia-smi, tolerating unsupported values."""
+        normalized = value.strip()
+        if not normalized or normalized.upper() == "N/A":
+            return None
+        try:
+            return float(normalized)
+        except ValueError:
+            return None
+
     def _query_nvidia_smi(self) -> list[GPUStat]:
         """Query live GPU status from `nvidia-smi`."""
         command = [
             "nvidia-smi",
-            "--query-gpu=index,name,memory.total,memory.used,utilization.gpu,temperature.gpu",
+            (
+                "--query-gpu=index,name,memory.total,memory.used,utilization.gpu,"
+                "temperature.gpu,power.draw,power.limit"
+            ),
             "--format=csv,noheader,nounits",
         ]
         try:
@@ -56,16 +81,27 @@ class GPUManager:
         gpus: list[GPUStat] = []
         for line in result.stdout.strip().splitlines():
             parts = [part.strip() for part in line.split(",")]
-            if len(parts) != 6:
+            if len(parts) != 8:
+                continue
+            gpu_index = self._parse_nvidia_int(parts[0])
+            memory_total_mb = self._parse_nvidia_int(parts[2])
+            memory_used_mb = self._parse_nvidia_int(parts[3])
+            utilization_gpu = self._parse_nvidia_int(parts[4])
+            temperature_c = self._parse_nvidia_int(parts[5])
+            power_draw_w = self._parse_nvidia_float(parts[6])
+            power_limit_w = self._parse_nvidia_float(parts[7])
+            if gpu_index is None:
                 continue
             gpus.append(
                 {
-                    "index": int(parts[0]),
+                    "index": gpu_index,
                     "name": parts[1],
-                    "memory_total_mb": int(parts[2]),
-                    "memory_used_mb": int(parts[3]),
-                    "utilization_gpu": int(parts[4]),
-                    "temperature_c": int(parts[5]),
+                    "memory_total_mb": memory_total_mb,
+                    "memory_used_mb": memory_used_mb,
+                    "utilization_gpu": utilization_gpu,
+                    "temperature_c": temperature_c,
+                    "power_draw_w": power_draw_w,
+                    "power_limit_w": power_limit_w,
                 }
             )
         return gpus
@@ -133,6 +169,8 @@ class GPUManager:
                     ),
                     "utilization_gpu": live_gpu.get("utilization_gpu"),
                     "temperature_c": live_gpu.get("temperature_c"),
+                    "power_draw_w": live_gpu.get("power_draw_w"),
+                    "power_limit_w": live_gpu.get("power_limit_w"),
                 }
                 enriched.append(state)
 
