@@ -554,13 +554,20 @@ def _rebuild_instance_with_new_gpus(
     user: User,
     new_gpu_indices: list[int],
     new_memory_gb: int,
+    *,
+    original_status_override: str | None = None,
+    original_stopped_at_override: datetime | None = None,
 ) -> Instance:
     """Rebuild an instance after a GPU config change using one fresh environment snapshot."""
     instance_obj = cast(Any, instance)
     user_obj = cast(Any, user)
     container_name = str(instance_obj.container_name)
-    original_status = str(instance_obj.status)
-    original_stopped_at = instance_obj.stopped_at
+    original_status = str(original_status_override or instance_obj.status)
+    original_stopped_at = (
+        original_stopped_at_override
+        if original_stopped_at_override is not None
+        else instance_obj.stopped_at
+    )
     original_runtime_image = _runtime_image_for_instance(instance)
     original_snapshot_image = (
         str(instance_obj.last_snapshot_image_name)
@@ -1426,6 +1433,13 @@ def rebuild_instance(
 
     instance = _get_instance_for_user(db, instance_id, current_user)
     instance_obj = cast(Any, instance)
+    original_status = str(instance_obj.status)
+    original_stopped_at = instance_obj.stopped_at
+    if original_status == "rebuilding":
+        raise HTTPException(
+            status_code=409,
+            detail="Instance rebuild is already in progress.",
+        )
     current_user_obj = cast(Any, current_user)
     current_gpu_count = len(list(instance_obj.gpu_indices))
     current_memory_gb = int(instance_obj.memory_gb)
@@ -1466,6 +1480,10 @@ def rebuild_instance(
             ),
         )
 
+    instance_obj.status = "rebuilding"
+    db.commit()
+    db.refresh(instance)
+
     with gpu_manager.locked_allocation():
         try:
             if payload.num_gpus == current_gpu_count:
@@ -1473,6 +1491,8 @@ def rebuild_instance(
                     instance,
                     new_memory_gb=payload.memory_gb,
                 )
+                instance_obj.status = original_status
+                instance_obj.stopped_at = original_stopped_at
                 LOGGER.info(
                     "Updated instance %s in place for user %s with memory %sGB",
                     instance_obj.container_name,
@@ -1487,6 +1507,8 @@ def rebuild_instance(
                     current_user,
                     selected_gpus,
                     payload.memory_gb,
+                    original_status_override=original_status,
+                    original_stopped_at_override=original_stopped_at,
                 )
                 LOGGER.info(
                     "Rebuilt instance %s for user %s with GPUs %s and memory %sGB",
@@ -1499,11 +1521,26 @@ def rebuild_instance(
             db.refresh(rebuilt_instance)
             return _serialize_instance(rebuilt_instance)
         except HTTPException:
-            db.rollback()
+            if str(instance_obj.status) == "rebuilding":
+                instance_obj.status = original_status
+                instance_obj.stopped_at = original_stopped_at
+            db.commit()
             raise
         except RuntimeError as exc:
+            if str(instance_obj.status) == "rebuilding":
+                instance_obj.status = original_status
+                instance_obj.stopped_at = original_stopped_at
             db.commit()
             raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except Exception as exc:
+            if str(instance_obj.status) == "rebuilding":
+                instance_obj.status = original_status
+                instance_obj.stopped_at = original_stopped_at
+            db.commit()
+            raise HTTPException(
+                status_code=500,
+                detail="Unexpected rebuild failure.",
+            ) from exc
 
 
 @app.get("/api/instances/{instance_id}/logs")
