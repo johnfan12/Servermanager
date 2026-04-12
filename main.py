@@ -57,6 +57,9 @@ logging.basicConfig(
 LOGGER = logging.getLogger(__name__)
 DISPLAY_NAME_MAX_LENGTH = 64
 CPU_ONLY_GPU_COUNT = 0
+DEFAULT_AUTO_STOP_HOURS = 6
+MIN_AUTO_STOP_HOURS = 1
+MAX_AUTO_STOP_HOURS = 72
 
 
 class InstanceStateChangedError(RuntimeError):
@@ -135,6 +138,60 @@ def _enforce_gpu_memory_limit(num_gpus: int, memory_gb: int) -> None:
                 f"when selecting {num_gpus} GPU(s)."
             ),
         )
+
+
+def _default_auto_stop_hours(instance: Instance | None = None) -> int:
+    """Return a safe auto-stop duration for one instance."""
+    if instance is None:
+        return DEFAULT_AUTO_STOP_HOURS
+    raw_value = getattr(cast(Any, instance), "auto_stop_hours", None)
+    try:
+        hours = int(raw_value)
+    except (TypeError, ValueError):
+        return DEFAULT_AUTO_STOP_HOURS
+    return max(MIN_AUTO_STOP_HOURS, min(MAX_AUTO_STOP_HOURS, hours))
+
+
+def _resolve_auto_stop_hours(*candidates: int | None, default: int | None = None) -> int:
+    """Pick the first valid auto-stop duration from request fields."""
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        hours = int(candidate)
+        if hours < MIN_AUTO_STOP_HOURS or hours > MAX_AUTO_STOP_HOURS:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Auto-stop hours must be between "
+                    f"{MIN_AUTO_STOP_HOURS} and {MAX_AUTO_STOP_HOURS}."
+                ),
+            )
+        return hours
+    if default is None:
+        raise HTTPException(status_code=400, detail="Auto-stop hours are required.")
+    return _resolve_auto_stop_hours(default)
+
+
+def _calculate_auto_stop_at(hours: int, *, now: datetime | None = None) -> datetime:
+    """Return one auto-stop deadline relative to now."""
+    return (now or datetime.utcnow()) + timedelta(hours=hours)
+
+
+def _set_instance_auto_stop(
+    instance: Instance,
+    hours: int,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Store the current auto-stop duration and its active deadline."""
+    instance_obj = cast(Any, instance)
+    instance_obj.auto_stop_hours = hours
+    instance_obj.expire_at = _calculate_auto_stop_at(hours, now=now)
+
+
+def _clear_instance_auto_stop(instance: Instance) -> None:
+    """End the active auto-stop timer for one stopped instance."""
+    cast(Any, instance).expire_at = None
 
 
 @asynccontextmanager
@@ -232,15 +289,39 @@ class InstanceCreateRequest(BaseModel):
     num_gpus: int = Field(ge=0)
     memory_gb: int = Field(ge=8)
     image: str
-    expire_hours: int = Field(ge=1, le=168)
+    auto_stop_hours: int | None = Field(
+        default=None, ge=MIN_AUTO_STOP_HOURS, le=MAX_AUTO_STOP_HOURS
+    )
+    expire_hours: int | None = Field(
+        default=None, ge=MIN_AUTO_STOP_HOURS, le=MAX_AUTO_STOP_HOURS
+    )
     display_name: str | None = Field(default=None, max_length=128)
 
 
-class InstanceRenewRequest(BaseModel):
-    """Request body for extending an instance expiration time."""
+class InstanceRestartRequest(BaseModel):
+    """Request body for restarting an instance with a fresh auto-stop timer."""
 
-    extend_hours: int | None = Field(default=None, ge=1, le=168)
-    extend_days: int | None = Field(default=None, ge=1, le=7)
+    auto_stop_hours: int | None = Field(
+        default=None, ge=MIN_AUTO_STOP_HOURS, le=MAX_AUTO_STOP_HOURS
+    )
+    expire_hours: int | None = Field(
+        default=None, ge=MIN_AUTO_STOP_HOURS, le=MAX_AUTO_STOP_HOURS
+    )
+
+
+class InstanceRenewRequest(BaseModel):
+    """Request body for resetting an instance auto-stop timer."""
+
+    reset_hours: int | None = Field(
+        default=None, ge=MIN_AUTO_STOP_HOURS, le=MAX_AUTO_STOP_HOURS
+    )
+    auto_stop_hours: int | None = Field(
+        default=None, ge=MIN_AUTO_STOP_HOURS, le=MAX_AUTO_STOP_HOURS
+    )
+    extend_hours: int | None = Field(
+        default=None, ge=MIN_AUTO_STOP_HOURS, le=MAX_AUTO_STOP_HOURS
+    )
+    extend_days: int | None = Field(default=None, ge=1, le=3)
 
 
 class QuotaUpdateRequest(BaseModel):
@@ -263,13 +344,14 @@ def _serialize_instance(instance: Instance) -> dict[str, Any]:
 
     cluster_manager 适配：返回字段包含
     id, container_name, gpu_indices, memory_gb, image_name, status,
-    ssh_port, ssh_password, expire_at（无到期时间时为 null）, created_at
+    ssh_port, ssh_password, auto_stop_at（无倒计时时为 null）, created_at
     """
     instance_obj = cast(Any, instance)
     expire_seconds = None
     expire_at = instance_obj.expire_at
     stopped_at = instance_obj.stopped_at
     ssh_port = instance_obj.ssh_port
+    auto_stop_hours = _default_auto_stop_hours(instance)
     if expire_at is not None:
         expire_seconds = int((expire_at - datetime.utcnow()).total_seconds())
     return {
@@ -301,6 +383,9 @@ def _serialize_instance(instance: Instance) -> dict[str, Any]:
         "status": instance_obj.status,
         "created_at": instance_obj.created_at.isoformat(),
         "stopped_at": stopped_at.isoformat() if stopped_at is not None else None,
+        "auto_stop_hours": auto_stop_hours,
+        "auto_stop_at": expire_at.isoformat() if expire_at is not None else None,
+        "auto_stop_seconds": expire_seconds,
         "expire_at": expire_at.isoformat() if expire_at is not None else None,
         "expire_seconds": expire_seconds,
     }
@@ -527,6 +612,7 @@ def _restore_instance_container(
     gpu_manager.release(str(instance_obj.container_name), db)
     instance_obj.status = "stopped"
     instance_obj.stopped_at = stopped_at or datetime.utcnow()
+    _clear_instance_auto_stop(instance)
 
 
 def _rebuild_instance_in_place(
@@ -1109,7 +1195,12 @@ def create_instance(
         )
 
     cpu_cores = max(4, payload.num_gpus * 8)
-    expire_at = datetime.utcnow() + timedelta(hours=payload.expire_hours)
+    auto_stop_hours = _resolve_auto_stop_hours(
+        payload.auto_stop_hours,
+        payload.expire_hours,
+        default=DEFAULT_AUTO_STOP_HOURS,
+    )
+    expire_at = _calculate_auto_stop_at(auto_stop_hours)
     container_name = _unique_name(f"gpu_user_{current_user_obj.username}")
     display_name = normalized_display_name or container_name
     existing_instance = (
@@ -1160,6 +1251,7 @@ def create_instance(
                 runtime_image_name=resolved_image_ref,
                 snapshot_status="none",
                 status="error",
+                auto_stop_hours=auto_stop_hours,
                 expire_at=expire_at,
             )
             db.add(instance)
@@ -1257,6 +1349,7 @@ def stop_instance(
         gpu_manager.release(str(instance_obj.container_name), db)
         instance_obj.status = "stopped"
         instance_obj.stopped_at = datetime.utcnow()
+        _clear_instance_auto_stop(instance)
         db.commit()
     except RuntimeError as exc:
         db.rollback()
@@ -1267,18 +1360,18 @@ def stop_instance(
 @app.post("/api/instances/{instance_id}/restart")
 def restart_instance(
     instance_id: int,
+    payload: InstanceRestartRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, str]:
     """Restart an instance after validating or reassigning its GPU reservation."""
     instance = _get_instance_for_user(db, instance_id, current_user)
     instance_obj = cast(Any, instance)
-    expire_at = instance_obj.expire_at
-    if expire_at is not None and expire_at <= datetime.utcnow():
-        raise HTTPException(
-            status_code=400,
-            detail="Instance has expired. Please renew before restarting.",
-        )
+    auto_stop_hours = _resolve_auto_stop_hours(
+        payload.auto_stop_hours,
+        payload.expire_hours,
+        default=DEFAULT_AUTO_STOP_HOURS,
+    )
 
     with gpu_manager.locked_allocation():
         try:
@@ -1290,6 +1383,7 @@ def restart_instance(
                 container_manager.restart_container(container_name)
                 instance_obj.status = "running"
                 instance_obj.stopped_at = None
+                _set_instance_auto_stop(instance, auto_stop_hours)
                 db.commit()
                 return {"message": "Instance restarted."}
 
@@ -1315,6 +1409,7 @@ def restart_instance(
                     current_user,
                     gpu_indices,
                 )
+                _set_instance_auto_stop(instance, auto_stop_hours)
                 LOGGER.info(
                     "Restarted instance %s for user %s with reassigned GPUs %s",
                     container_name,
@@ -1340,6 +1435,7 @@ def restart_instance(
             container_manager.restart_container(container_name)
             instance_obj.status = "running"
             instance_obj.stopped_at = None
+            _set_instance_auto_stop(instance, auto_stop_hours)
             db.commit()
         except HTTPException:
             db.rollback()
@@ -1363,38 +1459,30 @@ def renew_instance(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Extend instance expiration time when remaining time is under 7 days."""
+    """Reset the active auto-stop timer for one running instance."""
     instance = _get_instance_for_user(db, instance_id, current_user)
     instance_obj = cast(Any, instance)
     now = datetime.utcnow()
-    expire_at = instance_obj.expire_at
-    if expire_at is None:
-        raise HTTPException(
-            status_code=400, detail="Instance does not support renewal."
-        )
-
-    remaining_seconds = (expire_at - now).total_seconds()
-    if remaining_seconds > 7 * 24 * 3600:
+    if not _instance_is_running(instance):
         raise HTTPException(
             status_code=400,
-            detail="Renewal is only allowed when less than 7 days remain.",
+            detail="Auto-stop timer can only be reset while the instance is running.",
         )
 
-    extend_hours = payload.extend_hours
-    if extend_hours is None and payload.extend_days is not None:
-        extend_hours = payload.extend_days * 24
-    if extend_hours is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Renewal requires extend_hours or extend_days.",
-        )
-
-    base_time = expire_at if expire_at > now else now
-    instance_obj.expire_at = base_time + timedelta(hours=extend_hours)
+    reset_hours = payload.reset_hours
+    if reset_hours is None and payload.extend_days is not None:
+        reset_hours = payload.extend_days * 24
+    auto_stop_hours = _resolve_auto_stop_hours(
+        reset_hours,
+        payload.auto_stop_hours,
+        payload.extend_hours,
+        default=DEFAULT_AUTO_STOP_HOURS,
+    )
+    _set_instance_auto_stop(instance, auto_stop_hours, now=now)
     db.commit()
     db.refresh(instance)
     return {
-        "message": "Instance renewed.",
+        "message": "Auto-stop timer reset.",
         "instance": _serialize_instance(instance),
     }
 

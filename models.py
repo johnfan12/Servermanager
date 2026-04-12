@@ -73,6 +73,7 @@ class Instance(Base):
     status = Column(String(32), nullable=False, default="stopped")
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     stopped_at = Column(DateTime, nullable=True)
+    auto_stop_hours = Column(Integer, nullable=False, default=6)
     expire_at = Column(DateTime, nullable=True)
 
     user = relationship("User", back_populates="instances")

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 
@@ -76,18 +76,26 @@ class InstanceScheduler:
                 if actual_status == "running":
                     instance_obj.status = "running"
                     instance_obj.stopped_at = None
+                    if instance_obj.expire_at is None:
+                        hours = int(getattr(instance_obj, "auto_stop_hours", 6) or 6)
+                        hours = max(1, min(72, hours))
+                        instance_obj.expire_at = datetime.utcnow() + timedelta(
+                            hours=hours
+                        )
                 elif actual_status in {"exited", "created", "paused"}:
                     self.gpu_manager.release(str(instance_obj.container_name), db)
                     instance_obj.status = "stopped"
                     instance_obj.stopped_at = (
                         instance_obj.stopped_at or datetime.utcnow()
                     )
+                    instance_obj.expire_at = None
                 elif actual_status == "missing":
                     self.gpu_manager.release(str(instance_obj.container_name), db)
                     instance_obj.status = "error"
                     instance_obj.stopped_at = (
                         instance_obj.stopped_at or datetime.utcnow()
                     )
+                    instance_obj.expire_at = None
             db.commit()
         except Exception as exc:
             db.rollback()
@@ -96,7 +104,7 @@ class InstanceScheduler:
             db.close()
 
     def stop_expired_instances(self) -> None:
-        """Stop any running instances whose expiration time has passed."""
+        """Stop any running instances whose auto-stop deadline has passed."""
         db = self.session_factory()
         now = datetime.utcnow()
         try:
@@ -118,17 +126,18 @@ class InstanceScheduler:
                     self.gpu_manager.release(str(instance_obj.container_name), db)
                     instance_obj.status = "stopped"
                     instance_obj.stopped_at = now
+                    instance_obj.expire_at = None
                 except Exception as exc:
                     instance_obj.status = "error"
                     LOGGER.exception(
-                        "Failed to stop expired instance %s: %s",
+                        "Failed to auto-stop instance %s: %s",
                         instance_obj.container_name,
                         exc,
                     )
             db.commit()
         except Exception as exc:
             db.rollback()
-            LOGGER.exception("Failed to stop expired instances: %s", exc)
+            LOGGER.exception("Failed to auto-stop instances: %s", exc)
         finally:
             db.close()
 

@@ -50,6 +50,7 @@ def upgrade() -> None:
         sa.Column("status", sa.String(length=32), nullable=False),
         sa.Column("created_at", sa.DateTime(), nullable=False),
         sa.Column("stopped_at", sa.DateTime(), nullable=True),
+        sa.Column("auto_stop_hours", sa.Integer(), nullable=False, server_default="6"),
         sa.Column("expire_at", sa.DateTime(), nullable=True),
         sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
         sa.UniqueConstraint("container_name"),
