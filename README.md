@@ -164,10 +164,10 @@ docker build \
 - `DATABASE_URL`：节点 PostgreSQL 连接串
 - `FRP_TOKEN`：frps/frpc 共用 token
 - `FRP_CONTAINER_CONFIG_DIR`：默认 `/etc/frp/containers`
-- `ALLOW_REGISTER`：是否开放注册
+- `ALLOW_REGISTER`：历史配置，节点本地普通用户注册已废弃
 - Alembic 配置：`alembic.ini`
 
-### 获取节点 `admin_token`（用于 Clustermanager 的 `NODES_JSON`）
+### 节点管理员登录（仅内部维护用途）
 
 ```bash
 curl -s http://127.0.0.1:18881/api/auth/login \
@@ -176,7 +176,7 @@ curl -s http://127.0.0.1:18881/api/auth/login \
   | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])'
 ```
 
-将输出的 token 填到 `NODES_JSON.node1.admin_token`。
+该接口仅允许节点管理员账号使用，普通用户必须通过 Clustermanager 登录。
 
 ## 常见问题（QA）
 

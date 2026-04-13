@@ -18,15 +18,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from auth import (
+    build_shadow_password_hash,
     create_access_token,
     ensure_default_admin,
     get_admin_user,
     get_current_user,
-    hash_password,
     verify_password,
 )
 from config import (
-    ALLOW_REGISTER,
     CORS_ALLOW_CREDENTIALS,
     CORS_ALLOW_ORIGINS,
     ENV,
@@ -278,8 +277,11 @@ class InternalUserSyncRequest(BaseModel):
 
     username: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9_]+$")
     email: str = Field(min_length=3, max_length=255)
-    password_hash: str = Field(min_length=1, max_length=255)
+    password_hash: str | None = Field(default=None, max_length=255)
     is_admin: bool = False
+    quota_gpu: int | None = Field(default=None, ge=1)
+    quota_memory_gb: int | None = Field(default=None, ge=8)
+    quota_max_instances: int | None = Field(default=None, ge=1)
     ssh_public_keys: list[InternalSSHKeySyncRequest] = Field(default_factory=list)
 
 
@@ -1004,7 +1006,7 @@ def get_meta(db: Session = Depends(get_db)) -> dict[str, Any]:
     node_memory_free_gb = max(0, NODE_ALLOCATABLE_MEMORY_GB - node_memory_used_gb)
     return {
         "server_ip": SERVER_IP,
-        "allow_register": ALLOW_REGISTER,
+        "allow_register": False,
         "memory_options_gb": list(INSTANCE_MEMORY_OPTIONS_GB),
         "max_instance_memory_gb": MAX_INSTANCE_MEMORY_GB,
         "node_allocatable_memory_gb": NODE_ALLOCATABLE_MEMORY_GB,
@@ -1040,7 +1042,12 @@ def get_images() -> dict[str, Any]:
 
 @app.post("/api/auth/login")
 def login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
-    """Authenticate a user and return a JWT token."""
+    """Authenticate the node-local admin account for internal maintenance use only."""
+    if payload.username != ADMIN_USERNAME:
+        raise HTTPException(
+            status_code=403,
+            detail="Node-local user login has been removed. Use Clustermanager.",
+        )
     user = (
         db.query(User)
         .options(joinedload(User.instances))
@@ -1048,13 +1055,26 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict[str, Any
         .first()
     )
     if user is None:
-        raise HTTPException(status_code=401, detail="Incorrect username or password.")
+        raise HTTPException(
+            status_code=401, detail="Incorrect administrator username or password."
+        )
     user_obj = cast(Any, user)
+    if not bool(user_obj.is_admin):
+        raise HTTPException(
+            status_code=403,
+            detail="Node-local user login has been removed. Use Clustermanager.",
+        )
     if not verify_password(payload.password, str(user_obj.password_hash)):
-        raise HTTPException(status_code=401, detail="Incorrect username or password.")
+        raise HTTPException(
+            status_code=401, detail="Incorrect administrator username or password."
+        )
     usage = _get_running_usage(user)
     return {
-        "access_token": create_access_token(str(user_obj.username)),
+        "access_token": create_access_token(
+            str(user_obj.username),
+            is_admin=bool(user_obj.is_admin),
+            email=str(user_obj.email),
+        ),
         "token_type": "bearer",
         "user": {
             "id": user_obj.id,
@@ -1088,29 +1108,13 @@ def get_me(current_user: User = Depends(get_current_user)) -> dict[str, Any]:
 
 @app.post("/api/auth/register")
 def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> dict[str, str]:
-    """Create a new user account when registration is enabled."""
-    if not ALLOW_REGISTER:
-        raise HTTPException(status_code=403, detail="Registration is disabled.")
-    if db.query(User).filter(User.username == payload.username).first():
-        raise HTTPException(status_code=400, detail="Username is already in use.")
-    if db.query(User).filter(User.email == payload.email).first():
-        raise HTTPException(status_code=400, detail="Email is already in use.")
-
-    user = User(
-        username=payload.username,
-        password_hash=hash_password(payload.password),
-        email=payload.email,
+    """Node-local registration is deprecated; users must register via Clustermanager."""
+    del payload
+    del db
+    raise HTTPException(
+        status_code=410,
+        detail="Node-local registration has been removed. Use Clustermanager.",
     )
-    db.add(user)
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        raise HTTPException(
-            status_code=400,
-            detail="Username or email is already in use.",
-        ) from exc
-    return {"message": "Registration successful."}
 
 
 @app.get("/api/instances")
@@ -1797,41 +1801,47 @@ def sync_user_from_cluster(
     _: None = Depends(verify_internal_service_token),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Idempotently create or refresh one node-local user from central auth data."""
+    """Idempotently create or refresh one node shadow user from central auth data."""
     user = db.query(User).filter(User.username == payload.username).first()
     created = False
+    synced_email = payload.email
+
+    existing_email_owner = (
+        db.query(User)
+        .filter(User.email == payload.email, User.username != payload.username)
+        .first()
+    )
+    if existing_email_owner is not None:
+        synced_email = f"{payload.username}@shadow.local"
+        LOGGER.warning(
+            "Remapped shadow email for user=%s because email=%s is already used by user=%s",
+            payload.username,
+            payload.email,
+            cast(Any, existing_email_owner).username,
+        )
 
     if user is None:
         user = User(
             username=payload.username,
-            email=payload.email,
-            password_hash=payload.password_hash,
+            email=synced_email,
+            password_hash=build_shadow_password_hash(payload.username),
             is_admin=payload.is_admin,
         )
         db.add(user)
         created = True
     else:
         user_obj = cast(Any, user)
-        user_obj.password_hash = payload.password_hash
         user_obj.is_admin = payload.is_admin
-
-        existing_email_owner = (
-            db.query(User)
-            .filter(User.email == payload.email, User.username != payload.username)
-            .first()
-        )
-        if existing_email_owner is None:
-            user_obj.email = payload.email
-        else:
-            LOGGER.warning(
-                "Skipped email sync for user=%s because email=%s is already used by user=%s",
-                payload.username,
-                payload.email,
-                cast(Any, existing_email_owner).username,
-            )
+        user_obj.email = synced_email
 
     db.flush()
     user_obj = cast(Any, user)
+    if payload.quota_gpu is not None:
+        user_obj.quota_gpu = payload.quota_gpu
+    if payload.quota_memory_gb is not None:
+        user_obj.quota_memory_gb = payload.quota_memory_gb
+    if payload.quota_max_instances is not None:
+        user_obj.quota_max_instances = payload.quota_max_instances
     existing_keys = (
         db.query(UserSSHKey)
         .filter(UserSSHKey.user_id == int(user_obj.id))

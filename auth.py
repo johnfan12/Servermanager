@@ -20,6 +20,7 @@ from models import User
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+SHADOW_EMAIL_DOMAIN = "shadow.local"
 
 
 def hash_password(password: str) -> str:
@@ -32,11 +33,69 @@ def verify_password(plain_password: str, password_hash: str) -> bool:
     return pwd_context.verify(plain_password, password_hash)
 
 
-def create_access_token(subject: str, expires_delta: timedelta | None = None) -> str:
+def build_shadow_password_hash(subject: str) -> str:
+    """Create one non-interactive password hash for a node shadow user."""
+    return hash_password(f"shadow-only::{subject}::{JWT_SECRET}")
+
+
+def create_access_token(
+    subject: str,
+    expires_delta: timedelta | None = None,
+    *,
+    is_admin: bool = False,
+    email: str | None = None,
+) -> str:
     """Create a signed JWT for the given subject."""
     expire = datetime.utcnow() + (expires_delta or timedelta(hours=JWT_EXPIRE_HOURS))
-    payload: dict[str, Any] = {"sub": subject, "exp": expire}
+    payload: dict[str, Any] = {"sub": subject, "exp": expire, "is_admin": is_admin}
+    if email:
+        payload["email"] = email
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def _resolve_shadow_email(db: Session, username: str, email: str | None) -> str:
+    """Return one safe email for a node shadow user, avoiding unique conflicts."""
+    normalized = str(email or "").strip().lower()
+    candidate = normalized or f"{username}@{SHADOW_EMAIL_DOMAIN}"
+    existing = db.query(User).filter(User.email == candidate).first()
+    if existing is None or existing.username == username:
+        return candidate
+    return f"{username}@{SHADOW_EMAIL_DOMAIN}"
+
+
+def ensure_shadow_user(
+    db: Session,
+    username: str,
+    *,
+    is_admin: bool,
+    email: str | None = None,
+) -> User:
+    """Create or refresh one node shadow user from trusted JWT claims."""
+    user = db.query(User).filter(User.username == username).first()
+    resolved_email = _resolve_shadow_email(db, username, email)
+    changed = False
+
+    if user is None:
+        user = User(
+            username=username,
+            email=resolved_email,
+            password_hash=build_shadow_password_hash(username),
+            is_admin=is_admin,
+        )
+        db.add(user)
+        changed = True
+    else:
+        if user.is_admin != is_admin:
+            user.is_admin = is_admin
+            changed = True
+        if resolved_email and user.email != resolved_email:
+            user.email = resolved_email
+            changed = True
+
+    if changed:
+        db.commit()
+        db.refresh(user)
+    return user
 
 
 def get_current_user(
@@ -56,10 +115,12 @@ def get_current_user(
     except JWTError as exc:
         raise credentials_error from exc
 
-    user = db.query(User).filter(User.username == username).first()
-    if not user:
-        raise credentials_error
-    return user
+    return ensure_shadow_user(
+        db,
+        str(username),
+        is_admin=bool(payload.get("is_admin", username == ADMIN_USERNAME)),
+        email=payload.get("email"),
+    )
 
 
 def get_admin_user(current_user: User = Depends(get_current_user)) -> User:
