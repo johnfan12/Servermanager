@@ -1895,6 +1895,37 @@ def sync_user_from_cluster(
     }
 
 
+@app.delete("/api/internal/users/{username}")
+def delete_user_from_cluster(
+    username: str,
+    _: None = Depends(verify_internal_service_token),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Delete one node shadow user when the central account has been removed."""
+    if username == ADMIN_USERNAME:
+        raise HTTPException(status_code=400, detail="Cannot delete reserved admin user.")
+
+    user = db.query(User).filter(User.username == username).first()
+    if user is None:
+        return {"success": True, "deleted": False, "username": username}
+
+    user_obj = cast(Any, user)
+    if bool(user_obj.is_admin):
+        raise HTTPException(status_code=400, detail="Cannot delete admin user.")
+
+    instance_count = db.query(Instance).filter(Instance.user_id == int(user_obj.id)).count()
+    if instance_count > 0:
+        raise HTTPException(
+            status_code=409,
+            detail="User still has instances on this node.",
+        )
+
+    db.delete(user)
+    db.commit()
+    LOGGER.info("Deleted node shadow user user=%s", username)
+    return {"success": True, "deleted": True, "username": username}
+
+
 @app.get("/api/frp/containers")
 def list_frp_containers(
     _: None = Depends(verify_internal_service_token),
