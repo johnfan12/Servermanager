@@ -1,9 +1,10 @@
 #
 # Blackwell variant:
 # - keep the NGC image so Blackwell-optimized PyTorch stays available
+# - use the CUDA 13.0.2 NGC PyTorch release
 # - align the rest of the installed stack with Dockerfile.pytorch
 #
-FROM nvcr.io/nvidia/pytorch:25.03-py3
+FROM nvcr.io/nvidia/pytorch:25.11-py3
 
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=Etc/UTC \
