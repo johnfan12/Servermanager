@@ -70,6 +70,11 @@ class InstanceScheduler:
             instances = db.query(Instance).all()
             for instance in instances:
                 instance_obj = cast(Any, instance)
+                # A rebuild may temporarily stop/remove/recreate the container.
+                # Keep the explicit rebuilding state authoritative until the
+                # request handler finishes and writes the final outcome.
+                if str(instance_obj.status) == "rebuilding":
+                    continue
                 actual_status = self.container_manager.get_container_status(
                     str(instance_obj.container_name)
                 )

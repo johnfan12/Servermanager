@@ -456,6 +456,16 @@ def _instance_is_running(instance: Instance) -> bool:
     return str(cast(Any, instance).status) == "running"
 
 
+def _ensure_instance_not_rebuilding(instance: Instance) -> None:
+    """Reject lifecycle actions while one instance is in the rebuild critical section."""
+    if str(cast(Any, instance).status) != "rebuilding":
+        return
+    raise HTTPException(
+        status_code=409,
+        detail="Instance rebuild is already in progress.",
+    )
+
+
 def _add_gpu_allocations(db: Session, instance_id: int, gpu_indices: list[int]) -> None:
     """Insert GPU allocation rows for one instance."""
     for gpu_index in gpu_indices:
@@ -1335,6 +1345,7 @@ def delete_instance(
 ) -> dict[str, str]:
     """Delete one of the current user's instances."""
     instance = _get_instance_for_user(db, instance_id, current_user)
+    _ensure_instance_not_rebuilding(instance)
     _delete_instance(db, instance)
     return {"message": "Instance deleted."}
 
@@ -1347,6 +1358,7 @@ def stop_instance(
 ) -> dict[str, str]:
     """Stop a running instance owned by the current user."""
     instance = _get_instance_for_user(db, instance_id, current_user)
+    _ensure_instance_not_rebuilding(instance)
     instance_obj = cast(Any, instance)
     try:
         container_manager.stop_container(str(instance_obj.container_name))
@@ -1370,6 +1382,7 @@ def restart_instance(
 ) -> dict[str, str]:
     """Restart an instance after validating or reassigning its GPU reservation."""
     instance = _get_instance_for_user(db, instance_id, current_user)
+    _ensure_instance_not_rebuilding(instance)
     instance_obj = cast(Any, instance)
     auto_stop_hours = _resolve_auto_stop_hours(
         payload.auto_stop_hours,
@@ -1524,14 +1537,10 @@ def rebuild_instance(
     _enforce_gpu_memory_limit(payload.num_gpus, payload.memory_gb)
 
     instance = _get_instance_for_user(db, instance_id, current_user)
+    _ensure_instance_not_rebuilding(instance)
     instance_obj = cast(Any, instance)
     original_status = str(instance_obj.status)
     original_stopped_at = instance_obj.stopped_at
-    if original_status == "rebuilding":
-        raise HTTPException(
-            status_code=409,
-            detail="Instance rebuild is already in progress.",
-        )
     current_user_obj = cast(Any, current_user)
     current_gpu_count = len(list(instance_obj.gpu_indices))
     current_memory_gb = int(instance_obj.memory_gb)
@@ -1769,6 +1778,7 @@ def admin_delete_instance(
     )
     if not instance:
         raise HTTPException(status_code=404, detail="Instance not found.")
+    _ensure_instance_not_rebuilding(instance)
     _delete_instance(db, instance)
     return {"message": "Instance deleted."}
 
