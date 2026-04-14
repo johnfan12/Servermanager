@@ -157,6 +157,23 @@ docker build \
   -f docker/Dockerfile.pytorch_full .
 ```
 
+### 构建带 conda 环境的深度学习镜像
+
+```bash
+docker build -t lab/pytorch:conda-cu128 -f docker/Dockerfile.pytorch_conda .
+```
+
+这个镜像会创建名为 `dl` 的 conda 环境，并默认把它放到 `PATH` 前面。容器启动后，直接执行 `python` / `pip` 就会落在该环境中；通过 SSH 进入容器时也会自动激活。
+
+如需额外安装 `deepspeed`：
+
+```bash
+docker build \
+  --build-arg INSTALL_DEEPSPEED=1 \
+  -t lab/pytorch:conda-cu128 \
+  -f docker/Dockerfile.pytorch_conda .
+```
+
 ## 关键配置
 
 - `JWT_SECRET`：需与 Clustermanager 保持一致

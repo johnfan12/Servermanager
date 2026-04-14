@@ -1,0 +1,44 @@
+name: dl
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.4
+  - numpy
+  - scipy
+  - pandas
+  - scikit-learn
+  - matplotlib
+  - seaborn
+  - jupyterlab
+  - notebook
+  - ipywidgets
+  - tqdm
+  - pillow
+  - tensorboard
+  - pyarrow
+  - pyyaml
+  - rich
+  - ipdb
+  - einops
+  - safetensors
+  - sentencepiece
+  - huggingface_hub
+  - tokenizers
+  - transformers
+  - datasets
+  - accelerate
+  - peft
+  - evaluate
+  - timm
+  - xgboost
+  - lightgbm
+  - pip:
+      - opencv-python-headless
+      - lightning
