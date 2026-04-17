@@ -71,6 +71,8 @@ class Instance(Base):
     last_snapshot_at = Column(DateTime, nullable=True)
     snapshot_status = Column(String(32), nullable=False, default="none")
     status = Column(String(32), nullable=False, default="stopped")
+    last_exit_code = Column(Integer, nullable=True)
+    last_error = Column(Text, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     stopped_at = Column(DateTime, nullable=True)
     auto_stop_hours = Column(Integer, nullable=False, default=6)

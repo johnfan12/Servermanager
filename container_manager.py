@@ -584,14 +584,73 @@ class ContainerManager:
                 f"Failed to read logs for {container_name}: {exc}"
             ) from exc
 
-    def get_container_status(self, container_name: str) -> str:
-        """Return Docker's current status string for a container."""
+    def _container_failure_reason(
+        self,
+        container: Container,
+        state: dict[str, Any],
+        *,
+        exit_code: int | None,
+        logs_tail: int = 50,
+    ) -> str | None:
+        """Summarize one container failure from Docker state and recent logs."""
+        explicit_error = str(state.get("Error") or "").strip()
+        if explicit_error:
+            return explicit_error
+        if state.get("OOMKilled") is True:
+            return "Container was OOM-killed."
+        if exit_code in {None, 0}:
+            return None
+        try:
+            logs = container.logs(tail=logs_tail).decode("utf-8", errors="replace")
+        except DockerException:
+            logs = ""
+        for line in reversed(logs.splitlines()):
+            cleaned = line.strip()
+            if cleaned:
+                return f"Container exited with code {exit_code}: {cleaned}"
+        return f"Container exited with code {exit_code}."
+
+    def inspect_container_state(self, container_name: str) -> dict[str, Any]:
+        """Return detailed Docker runtime state for one container."""
         try:
             container = self._container_by_name(container_name)
             container.reload()
-            return container.status
+            state = container.attrs.get("State", {}) or {}
+            raw_status = state.get("Status") or container.status or ""
+            raw_exit_code = state.get("ExitCode")
+            exit_code: int | None = None
+            if raw_exit_code is not None:
+                try:
+                    exit_code = int(raw_exit_code)
+                except (TypeError, ValueError):
+                    exit_code = None
+            return {
+                "status": str(raw_status or "unknown"),
+                "exit_code": exit_code,
+                "error": str(state.get("Error") or "").strip() or None,
+                "oom_killed": bool(state.get("OOMKilled")),
+                "finished_at": state.get("FinishedAt"),
+                "failure_reason": self._container_failure_reason(
+                    container,
+                    state,
+                    exit_code=exit_code,
+                ),
+            }
         except RuntimeError:
-            return "missing"
+            return {
+                "status": "missing",
+                "exit_code": None,
+                "error": None,
+                "oom_killed": False,
+                "finished_at": None,
+                "failure_reason": None,
+            }
+
+    def get_container_status(self, container_name: str) -> str:
+        """Return Docker's current status string for a container."""
+        return str(
+            self.inspect_container_state(container_name).get("status") or "missing"
+        )
 
     def list_managed_containers(self) -> list[Container]:
         """Return all containers created by this service naming convention."""

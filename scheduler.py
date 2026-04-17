@@ -75,21 +75,44 @@ class InstanceScheduler:
                 # request handler finishes and writes the final outcome.
                 if str(instance_obj.status) == "rebuilding":
                     continue
-                actual_status = self.container_manager.get_container_status(
+                runtime_state = self.container_manager.inspect_container_state(
                     str(instance_obj.container_name)
                 )
+                actual_status = str(runtime_state.get("status") or "missing")
+                exit_code = runtime_state.get("exit_code")
+                failure_reason = str(runtime_state.get("failure_reason") or "").strip()
                 if actual_status == "running":
                     instance_obj.status = "running"
                     instance_obj.stopped_at = None
+                    instance_obj.last_error = None
+                    instance_obj.last_exit_code = None
                     if instance_obj.expire_at is None:
                         hours = int(getattr(instance_obj, "auto_stop_hours", 6) or 6)
                         hours = max(1, min(72, hours))
                         instance_obj.expire_at = datetime.utcnow() + timedelta(
                             hours=hours
                         )
-                elif actual_status in {"exited", "created", "paused"}:
+                elif actual_status in {"exited", "dead"}:
+                    self.gpu_manager.release(str(instance_obj.container_name), db)
+                    if exit_code not in {None, 0} or failure_reason:
+                        instance_obj.status = "start_failed"
+                        instance_obj.last_error = (
+                            failure_reason
+                            or f"Container exited unexpectedly with code {exit_code}."
+                        )
+                    else:
+                        instance_obj.status = "stopped"
+                        instance_obj.last_error = None
+                    instance_obj.last_exit_code = exit_code
+                    instance_obj.stopped_at = (
+                        instance_obj.stopped_at or datetime.utcnow()
+                    )
+                    instance_obj.expire_at = None
+                elif actual_status in {"created", "paused"}:
                     self.gpu_manager.release(str(instance_obj.container_name), db)
                     instance_obj.status = "stopped"
+                    instance_obj.last_error = None
+                    instance_obj.last_exit_code = exit_code
                     instance_obj.stopped_at = (
                         instance_obj.stopped_at or datetime.utcnow()
                     )
@@ -97,6 +120,8 @@ class InstanceScheduler:
                 elif actual_status == "missing":
                     self.gpu_manager.release(str(instance_obj.container_name), db)
                     instance_obj.status = "error"
+                    instance_obj.last_error = "Container was not found in Docker runtime."
+                    instance_obj.last_exit_code = None
                     instance_obj.stopped_at = (
                         instance_obj.stopped_at or datetime.utcnow()
                     )
@@ -130,10 +155,13 @@ class InstanceScheduler:
                     )
                     self.gpu_manager.release(str(instance_obj.container_name), db)
                     instance_obj.status = "stopped"
+                    instance_obj.last_error = None
+                    instance_obj.last_exit_code = None
                     instance_obj.stopped_at = now
                     instance_obj.expire_at = None
                 except Exception as exc:
                     instance_obj.status = "error"
+                    instance_obj.last_error = f"Failed to auto-stop instance: {exc}"
                     LOGGER.exception(
                         "Failed to auto-stop instance %s: %s",
                         instance_obj.container_name,

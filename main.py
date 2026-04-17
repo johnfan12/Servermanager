@@ -193,6 +193,27 @@ def _clear_instance_auto_stop(instance: Instance) -> None:
     cast(Any, instance).expire_at = None
 
 
+def _clear_instance_runtime_error(instance: Instance) -> None:
+    """Drop the last recorded runtime failure for one instance."""
+    instance_obj = cast(Any, instance)
+    instance_obj.last_error = None
+    instance_obj.last_exit_code = None
+
+
+def _set_instance_runtime_error(
+    instance: Instance,
+    detail: str,
+    *,
+    status: str = "error",
+    exit_code: int | None = None,
+) -> None:
+    """Persist one instance runtime failure for later display."""
+    instance_obj = cast(Any, instance)
+    instance_obj.status = status
+    instance_obj.last_error = detail
+    instance_obj.last_exit_code = exit_code
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     """Initialize and tear down persistent services around app lifetime."""
@@ -383,6 +404,8 @@ def _serialize_instance(instance: Instance) -> dict[str, Any]:
         else None,
         "snapshot_status": instance_obj.snapshot_status or "none",
         "status": instance_obj.status,
+        "last_exit_code": instance_obj.last_exit_code,
+        "last_error": instance_obj.last_error,
         "created_at": instance_obj.created_at.isoformat(),
         "stopped_at": stopped_at.isoformat() if stopped_at is not None else None,
         "auto_stop_hours": auto_stop_hours,
@@ -618,6 +641,7 @@ def _restore_instance_container(
         _add_gpu_allocations(db, int(instance_obj.id), gpu_indices)
         instance_obj.status = "running"
         instance_obj.stopped_at = None
+        _clear_instance_runtime_error(instance)
         return
 
     container_manager.stop_container(str(instance_obj.container_name))
@@ -625,6 +649,7 @@ def _restore_instance_container(
     instance_obj.status = "stopped"
     instance_obj.stopped_at = stopped_at or datetime.utcnow()
     _clear_instance_auto_stop(instance)
+    _clear_instance_runtime_error(instance)
 
 
 def _rebuild_instance_in_place(
@@ -707,7 +732,13 @@ def _rebuild_instance_with_new_gpus(
             try:
                 container_manager.restart_container(container_name)
             except RuntimeError as restart_exc:
-                instance_obj.status = "error"
+                _set_instance_runtime_error(
+                    instance,
+                    (
+                        "Failed to restart original container after snapshot failure: "
+                        f"{restart_exc}"
+                    ),
+                )
                 LOGGER.exception(
                     "Failed to restore running state after snapshot failure for %s",
                     container_name,
@@ -730,7 +761,10 @@ def _rebuild_instance_with_new_gpus(
             try:
                 container_manager.restart_container(container_name)
             except RuntimeError:
-                instance_obj.status = "error"
+                _set_instance_runtime_error(
+                    instance,
+                    "Failed to restore original container after removing it during rebuild.",
+                )
         instance_obj.status = original_status
         instance_obj.stopped_at = original_stopped_at
         raise RuntimeError(
@@ -787,7 +821,10 @@ def _rebuild_instance_with_new_gpus(
             instance_obj.gpu_indices = original_gpu_indices
             instance_obj.memory_gb = original_memory_gb
             instance_obj.cpu_cores = original_cpu_cores
-            instance_obj.status = "error"
+            _set_instance_runtime_error(
+                instance,
+                f"Failed to rollback instance after rebuild error: {rollback_exc}",
+            )
             instance_obj.stopped_at = datetime.utcnow()
             LOGGER.exception(
                 "Failed to rollback instance %s after rebuild error: %s",
@@ -978,7 +1015,10 @@ def _restart_instance_with_reassigned_gpus(
             instance_obj.runtime_image_name = new_runtime_image
             instance_obj.last_snapshot_image_name = new_runtime_image
             instance_obj.snapshot_status = "failed"
-            instance_obj.status = "error"
+            _set_instance_runtime_error(
+                instance,
+                f"Failed to restore stopped instance after restart error: {rollback_exc}",
+            )
             instance_obj.stopped_at = datetime.utcnow()
             LOGGER.exception(
                 "Failed to restore stopped instance %s after restart error: %s",
@@ -1287,6 +1327,7 @@ def create_instance(
             instance_obj.ssh_port = int(container_info["ssh_port"])
             instance_obj.ssh_password = str(container_info["ssh_password"])
             instance_obj.status = "running"
+            _clear_instance_runtime_error(instance)
             _add_gpu_allocations(db, int(instance.id), selected_gpus)
             LOGGER.info(
                 "Created instance %s for user %s",
@@ -1366,6 +1407,7 @@ def stop_instance(
         instance_obj.status = "stopped"
         instance_obj.stopped_at = datetime.utcnow()
         _clear_instance_auto_stop(instance)
+        _clear_instance_runtime_error(instance)
         db.commit()
     except RuntimeError as exc:
         db.rollback()
@@ -1401,6 +1443,7 @@ def restart_instance(
                 instance_obj.status = "running"
                 instance_obj.stopped_at = None
                 _set_instance_auto_stop(instance, auto_stop_hours)
+                _clear_instance_runtime_error(instance)
                 db.commit()
                 return {"message": "Instance restarted."}
 
@@ -1433,6 +1476,7 @@ def restart_instance(
                     cast(Any, current_user).username,
                     gpu_indices,
                 )
+                _clear_instance_runtime_error(instance)
                 db.commit()
                 return {"message": "Instance restarted."}
 
@@ -1453,6 +1497,7 @@ def restart_instance(
             instance_obj.status = "running"
             instance_obj.stopped_at = None
             _set_instance_auto_stop(instance, auto_stop_hours)
+            _clear_instance_runtime_error(instance)
             db.commit()
         except HTTPException:
             db.rollback()
