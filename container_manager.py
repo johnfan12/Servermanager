@@ -600,12 +600,20 @@ class ContainerManager:
             return "Container was OOM-killed."
         if exit_code in {None, 0}:
             return None
+        if exit_code == 143:
+            return None
         try:
             logs = container.logs(tail=logs_tail).decode("utf-8", errors="replace")
         except DockerException:
             logs = ""
         for line in reversed(logs.splitlines()):
             cleaned = line.strip()
+            if not cleaned:
+                continue
+            if cleaned == "[ OK ]":
+                continue
+            if cleaned.endswith("[ OK ]"):
+                continue
             if cleaned:
                 return f"Container exited with code {exit_code}: {cleaned}"
         return f"Container exited with code {exit_code}."

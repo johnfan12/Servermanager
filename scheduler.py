@@ -94,7 +94,8 @@ class InstanceScheduler:
                         )
                 elif actual_status in {"exited", "dead"}:
                     self.gpu_manager.release(str(instance_obj.container_name), db)
-                    if exit_code not in {None, 0} or failure_reason:
+                    should_be_running = str(instance_obj.status) == "running"
+                    if should_be_running and (exit_code not in {None, 0, 143} or failure_reason):
                         instance_obj.status = "start_failed"
                         instance_obj.last_error = (
                             failure_reason
