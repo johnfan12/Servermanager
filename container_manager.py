@@ -100,6 +100,24 @@ class ContainerManager:
         alphabet = string.ascii_letters + string.digits
         return "".join(secrets.choice(alphabet) for _ in range(length))
 
+    def _terminal_notice_script(self) -> str:
+        """Return a shell snippet shown for every interactive terminal session."""
+        return """if [ -z "${PS1:-}" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+if [ -n "${SERVERMANAGER_NOTICE_SHOWN:-}" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+export SERVERMANAGER_NOTICE_SHOWN=1
+cat <<'EOF'
+[Servermanager Notice]
+1. Only /root/workspace is considered a safe persistent directory.
+2. Avoid changing too many system packages or base configuration inside the container.
+3. For Python projects, create a dedicated virtual environment under your project folder, for example:
+   python -m venv /root/workspace/<project>/.venv
+EOF
+"""
+
     def _safe_path(self, base_dir: Path, child_name: str) -> Path:
         """Return a child path constrained to remain under its base directory."""
         base_path = base_dir.resolve(strict=False)
@@ -265,14 +283,23 @@ class ContainerManager:
         authorized_keys_content = "\n".join(
             key.strip() for key in authorized_keys if key and key.strip()
         )
+        notice_script_content = self._terminal_notice_script()
         encoded_keys = base64.b64encode(
             authorized_keys_content.encode("utf-8")
+        ).decode("ascii")
+        encoded_notice = base64.b64encode(
+            notice_script_content.encode("utf-8")
         ).decode("ascii")
         return (
             '/bin/bash -lc "mkdir -p /var/run/sshd; '
             'mkdir -p /root/.ssh; chmod 700 /root/.ssh; '
             f"printf %s {shlex.quote(encoded_keys)} | base64 -d > /root/.ssh/authorized_keys; "
             'chmod 600 /root/.ssh/authorized_keys; '
+            'mkdir -p /etc/profile.d; '
+            f"printf %s {shlex.quote(encoded_notice)} | base64 -d > /etc/profile.d/servermanager-notice.sh; "
+            'chmod 644 /etc/profile.d/servermanager-notice.sh; '
+            "grep -qxF 'test -f /etc/profile.d/servermanager-notice.sh && . /etc/profile.d/servermanager-notice.sh' /root/.bashrc || "
+            "echo 'test -f /etc/profile.d/servermanager-notice.sh && . /etc/profile.d/servermanager-notice.sh' >> /root/.bashrc; "
             f"echo root:{password} | chpasswd; "
             "(service ssh start || /etc/init.d/ssh start || /usr/sbin/sshd); "
             'trap : TERM INT; sleep infinity & wait"'
