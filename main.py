@@ -841,6 +841,123 @@ def _rebuild_instance_with_new_gpus(
         ) from exc
 
 
+def _repair_instance_with_base_image(
+    db: Session,
+    instance: Instance,
+    user: User,
+    target_gpu_indices: list[int],
+    *,
+    original_status_override: str | None = None,
+    original_stopped_at_override: datetime | None = None,
+) -> Instance:
+    """Recreate one broken/stopped instance from its base image while keeping workspace."""
+    instance_obj = cast(Any, instance)
+    user_obj = cast(Any, user)
+    container_name = str(instance_obj.container_name)
+    original_status = str(original_status_override or instance_obj.status)
+    original_stopped_at = (
+        original_stopped_at_override
+        if original_stopped_at_override is not None
+        else instance_obj.stopped_at
+    )
+    original_runtime_image = _runtime_image_for_instance(instance)
+    original_snapshot_image = (
+        str(instance_obj.last_snapshot_image_name)
+        if instance_obj.last_snapshot_image_name
+        else None
+    )
+    original_snapshot_at = instance_obj.last_snapshot_at
+    original_gpu_indices = list(instance_obj.gpu_indices)
+    original_memory_gb = int(instance_obj.memory_gb)
+    workspace_dir = container_manager.locate_instance_workspace_dir(
+        str(user_obj.username), container_name
+    )
+
+    try:
+        repair_image = container_manager.ensure_image_available(
+            str(
+                instance_obj.base_image_name
+                or instance_obj.image_name
+                or instance_obj.runtime_image_name
+            )
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Base image for repairing instance {container_name} is unavailable: {exc}"
+        ) from exc
+
+    try:
+        container_manager.remove_container(container_name)
+    except RuntimeError as exc:
+        if "not found" not in str(exc).lower():
+            raise RuntimeError(
+                f"Failed to remove broken container {container_name}: {exc}"
+            ) from exc
+
+    gpu_manager.release(container_name, db)
+
+    target_cpu_cores = max(4, len(target_gpu_indices) * 8)
+    if target_gpu_indices:
+        gpu_manager.allocate(
+            user,
+            target_gpu_indices,
+            original_memory_gb,
+            target_cpu_cores,
+            db,
+        )
+
+    try:
+        _restore_instance_container(
+            db,
+            instance,
+            user,
+            image_name=repair_image,
+            gpu_indices=list(target_gpu_indices),
+            memory_gb=original_memory_gb,
+            cpu_cores=target_cpu_cores,
+            workspace_dir=workspace_dir,
+            running=True,
+            stopped_at=None,
+        )
+        instance_obj.image_name = repair_image
+        instance_obj.base_image_name = repair_image
+        instance_obj.runtime_image_name = repair_image
+        instance_obj.last_snapshot_image_name = None
+        instance_obj.last_snapshot_at = None
+        instance_obj.snapshot_status = "none"
+        for image_ref in {original_runtime_image, original_snapshot_image}:
+            _cleanup_snapshot_image_if_unused(
+                db,
+                image_ref,
+                exclude_instance_id=int(instance_obj.id),
+            )
+        return instance
+    except Exception as exc:
+        try:
+            container_manager.remove_container(container_name)
+        except RuntimeError:
+            pass
+        gpu_manager.release(container_name, db)
+        instance_obj.gpu_indices = original_gpu_indices
+        instance_obj.memory_gb = original_memory_gb
+        instance_obj.runtime_image_name = original_runtime_image
+        instance_obj.last_snapshot_image_name = original_snapshot_image
+        instance_obj.last_snapshot_at = original_snapshot_at
+        instance_obj.snapshot_status = "ready" if original_snapshot_image else "none"
+        instance_obj.stopped_at = original_stopped_at or datetime.utcnow()
+        _set_instance_runtime_error(
+            instance,
+            (
+                "Failed to repair instance from base image; only workspace would be kept. "
+                f"Original error: {exc}"
+            ),
+            status=original_status if original_status in {"error", "start_failed"} else "error",
+        )
+        raise RuntimeError(
+            f"Failed to repair instance {container_name} from base image: {exc}"
+        ) from exc
+
+
 def _choose_instance_gpu_indices(
     db: Session,
     instance: Instance,
@@ -1686,6 +1803,77 @@ def rebuild_instance(
             raise HTTPException(
                 status_code=500,
                 detail="Unexpected rebuild failure.",
+            ) from exc
+
+
+@app.post("/api/instances/{instance_id}/repair")
+def repair_instance(
+    instance_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Repair one broken instance by recreating it from its base image and workspace."""
+    instance = _get_instance_for_user(db, instance_id, current_user)
+    _ensure_instance_not_rebuilding(instance)
+    instance_obj = cast(Any, instance)
+    if _instance_is_running(instance):
+        raise HTTPException(
+            status_code=400,
+            detail="Repair is only available when the instance is stopped or failed.",
+        )
+
+    original_status = str(instance_obj.status)
+    original_stopped_at = instance_obj.stopped_at
+    instance_obj.status = "rebuilding"
+    db.commit()
+    db.refresh(instance)
+
+    with gpu_manager.locked_allocation():
+        try:
+            target_gpu_indices = _choose_instance_gpu_indices(
+                db,
+                instance,
+                len(list(instance_obj.gpu_indices)),
+                insufficient_detail="Not enough available GPUs to repair this instance.",
+            )
+            repaired_instance = _repair_instance_with_base_image(
+                db,
+                instance,
+                current_user,
+                target_gpu_indices,
+                original_status_override=original_status,
+                original_stopped_at_override=original_stopped_at,
+            )
+            LOGGER.info(
+                "Repaired instance %s for user %s using base image %s",
+                instance_obj.container_name,
+                cast(Any, current_user).username,
+                cast(Any, repaired_instance).base_image_name
+                or cast(Any, repaired_instance).image_name,
+            )
+            db.commit()
+            db.refresh(repaired_instance)
+            return _serialize_instance(repaired_instance)
+        except HTTPException:
+            if str(instance_obj.status) == "rebuilding":
+                instance_obj.status = original_status
+                instance_obj.stopped_at = original_stopped_at
+            db.commit()
+            raise
+        except RuntimeError as exc:
+            if str(instance_obj.status) == "rebuilding":
+                instance_obj.status = original_status
+                instance_obj.stopped_at = original_stopped_at
+            db.commit()
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except Exception as exc:
+            if str(instance_obj.status) == "rebuilding":
+                instance_obj.status = original_status
+                instance_obj.stopped_at = original_stopped_at
+            db.commit()
+            raise HTTPException(
+                status_code=500,
+                detail="Unexpected repair failure.",
             ) from exc
 
 
