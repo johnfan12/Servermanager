@@ -436,17 +436,12 @@ EOF
         container_name: str,
         *,
         memory_gb: int,
-        cpu_cores: int,
     ) -> None:
-        """Update one existing container's memory and CPU limits in place."""
-        cpu_period = 100_000
-        cpu_quota = max(1, int(cpu_cores)) * cpu_period
+        """Update one existing container's memory limit in place."""
         try:
             self._container_by_name(container_name).update(
                 mem_limit=f"{memory_gb}g",
                 memswap_limit=f"{memory_gb}g",
-                cpu_period=cpu_period,
-                cpu_quota=cpu_quota,
             )
         except DockerException as exc:
             raise RuntimeError(

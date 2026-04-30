@@ -659,15 +659,11 @@ def _rebuild_instance_in_place(
 ) -> Instance:
     """Apply a memory-only config change without recreating the container."""
     instance_obj = cast(Any, instance)
-    current_gpu_count = len(list(instance_obj.gpu_indices))
-    new_cpu_cores = max(4, current_gpu_count * 8)
     container_manager.update_container_resources(
         str(instance_obj.container_name),
         memory_gb=new_memory_gb,
-        cpu_cores=new_cpu_cores,
     )
     instance_obj.memory_gb = new_memory_gb
-    instance_obj.cpu_cores = new_cpu_cores
     return instance
 
 
