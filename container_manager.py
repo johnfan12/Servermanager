@@ -50,7 +50,7 @@ class ContainerManager:
         self._data_root = self._resolve_data_root()
 
     def _resolve_data_root(self) -> Path:
-        """Choose a writable workspace root once at startup."""
+        """Choose the currently writable workspace root."""
         primary_root = Path(DATA_DIR)
         fallback_root = Path(FALLBACK_DATA_DIR)
 
@@ -68,6 +68,18 @@ class ContainerManager:
                 fallback_root,
             )
             return fallback_root
+
+    def _current_data_root(self) -> Path:
+        """Refresh and return the current writable workspace root."""
+        data_root = self._resolve_data_root()
+        if data_root != self._data_root:
+            LOGGER.info(
+                "Workspace data root changed from %s to %s",
+                self._data_root,
+                data_root,
+            )
+            self._data_root = data_root
+        return self._data_root
 
     def _docker_client(self) -> docker.DockerClient:
         """Return a lazily initialized Docker client."""
@@ -179,6 +191,7 @@ EOF
 
     def get_data_root_status(self) -> dict[str, Any]:
         """Return diagnostic information about the configured workspace root."""
+        active_root = self._current_data_root()
         data_dir = Path(DATA_DIR)
         fallback_dir = Path(FALLBACK_DATA_DIR)
         return {
@@ -186,9 +199,9 @@ EOF
             "data_dir_resolved": str(data_dir.resolve(strict=False)),
             "data_dir_exists": data_dir.exists(),
             "data_dir_device": self._path_device_id(data_dir),
-            "active_data_root": str(self._data_root),
-            "active_data_root_resolved": str(self._data_root.resolve(strict=False)),
-            "active_data_root_device": self._path_device_id(self._data_root),
+            "active_data_root": str(active_root),
+            "active_data_root_resolved": str(active_root.resolve(strict=False)),
+            "active_data_root_device": self._path_device_id(active_root),
             "fallback_data_dir": str(fallback_dir),
             "fallback_data_dir_resolved": str(fallback_dir.resolve(strict=False)),
             "fallback_data_dir_exists": fallback_dir.exists(),
@@ -262,13 +275,14 @@ EOF
     def _ensure_user_data_dir(self, username: str) -> Path:
         """Ensure the per-user data root directory exists."""
         safe_username = self._validated_username(username)
-        user_dir = self._safe_path(self._data_root, safe_username)
+        data_root = self._current_data_root()
+        user_dir = self._safe_path(data_root, safe_username)
         try:
             user_dir.mkdir(parents=True, exist_ok=True)
             return user_dir
         except OSError as exc:
             raise RuntimeError(
-                f"Failed to prepare user workspace directory under {self._data_root}: {exc}"
+                f"Failed to prepare user workspace directory under {data_root}: {exc}"
             ) from exc
 
     def _user_data_dir(self, username: str, *, create: bool) -> Path:
@@ -276,7 +290,7 @@ EOF
         if create:
             return self._ensure_user_data_dir(username)
         safe_username = self._validated_username(username)
-        return self._safe_path(self._data_root, safe_username)
+        return self._safe_path(self._current_data_root(), safe_username)
 
     def get_instance_workspace_dir(
         self, username: str, container_name: str, create: bool = True
@@ -420,6 +434,11 @@ EOF
         ).decode("ascii")
         return (
             '/bin/bash -lc "mkdir -p /var/run/sshd; '
+            'mkdir -p /root/workspace; '
+            'if [ -d /workspace ] && [ ! -L /workspace ] && [ -z \\"$(ls -A /workspace 2>/dev/null)\\" ]; then '
+            'rmdir /workspace && ln -s /root/workspace /workspace; '
+            'fi; '
+            '[ -e /workspace ] || ln -s /root/workspace /workspace; '
             'mkdir -p /root/.ssh; chmod 700 /root/.ssh; '
             f"printf %s {shlex.quote(encoded_keys)} | base64 -d > /root/.ssh/authorized_keys; "
             'chmod 600 /root/.ssh/authorized_keys; '

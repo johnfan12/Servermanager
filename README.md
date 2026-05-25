@@ -248,6 +248,11 @@ curl -X POST http://127.0.0.1:18881/api/admin/instances/<INSTANCE_ID>/remount-wo
 
 该接口会要求实例先停机，随后创建容器快照、按当前 `DATA_DIR` 重建同名容器；如果当前目标 workspace 为空且旧来源仍可读，会先复制旧 workspace 数据。
 
+如果刷新后重连仍看不到 workspace，优先检查两件事：
+
+- `GET /api/admin/storage` 返回的 `active_data_root` 是否仍是 `Servermanager/data/users` fallback。若是，说明服务启动时 `/data/users` 不可写；先修复挂载，再重启 Servermanager 或再次执行刷新挂载。
+- 容器内持久目录是 `/root/workspace`。新建或刷新后的容器会在 `/workspace` 为空时自动把它指向 `/root/workspace`，但已有旧容器需要再次执行刷新挂载后才会得到这个兼容链接。
+
 ### Q6: 新增实例后旧实例 SSH 掉线
 - 确认你已切换到 per-instance 模式：
   - 节点侧使用 `frpc-container@*.service`
