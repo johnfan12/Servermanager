@@ -119,12 +119,133 @@ EOF
 """
 
     def _safe_path(self, base_dir: Path, child_name: str) -> Path:
-        """Return a child path constrained to remain under its base directory."""
-        base_path = base_dir.resolve(strict=False)
-        candidate = (base_path / child_name).resolve(strict=False)
-        if os.path.commonpath([str(base_path), str(candidate)]) != str(base_path):
+        """Return a logical child path constrained to remain under its base directory."""
+        base_path = Path(base_dir)
+        if not base_path.is_absolute():
+            base_path = base_path.resolve(strict=False)
+        candidate = base_path / child_name
+
+        resolved_base = base_path.resolve(strict=False)
+        resolved_candidate = candidate.resolve(strict=False)
+        if (
+            os.path.commonpath([str(resolved_base), str(resolved_candidate)])
+            != str(resolved_base)
+        ):
             raise RuntimeError(f"Unsafe path segment rejected: {child_name}")
         return candidate
+
+    def _path_device_id(self, path: Path) -> str | None:
+        """Return a stable major:minor device id for a host path if it exists."""
+        try:
+            stat_result = path.stat()
+        except OSError:
+            return None
+        return f"{os.major(stat_result.st_dev)}:{os.minor(stat_result.st_dev)}"
+
+    def _paths_same_location(self, left: Path, right: Path) -> bool:
+        """Return whether two host paths currently point to the same filesystem entry."""
+        try:
+            return left.samefile(right)
+        except OSError:
+            return left.resolve(strict=False) == right.resolve(strict=False)
+
+    def paths_same_location(self, left: Path, right: Path) -> bool:
+        """Public wrapper for comparing two host paths."""
+        return self._paths_same_location(left, right)
+
+    def path_contains(self, parent: Path, child: Path) -> bool:
+        """Return whether child is currently located underneath parent."""
+        resolved_parent = parent.resolve(strict=False)
+        resolved_child = child.resolve(strict=False)
+        return (
+            resolved_parent != resolved_child
+            and os.path.commonpath([str(resolved_parent), str(resolved_child)])
+            == str(resolved_parent)
+        )
+
+    def workspace_has_entries(self, workspace_dir: Path) -> bool:
+        """Return whether a workspace directory contains any entries."""
+        try:
+            next(workspace_dir.iterdir())
+            return True
+        except StopIteration:
+            return False
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise RuntimeError(
+                f"Failed to inspect workspace directory {workspace_dir}: {exc}"
+            ) from exc
+
+    def get_data_root_status(self) -> dict[str, Any]:
+        """Return diagnostic information about the configured workspace root."""
+        data_dir = Path(DATA_DIR)
+        fallback_dir = Path(FALLBACK_DATA_DIR)
+        return {
+            "data_dir": str(data_dir),
+            "data_dir_resolved": str(data_dir.resolve(strict=False)),
+            "data_dir_exists": data_dir.exists(),
+            "data_dir_device": self._path_device_id(data_dir),
+            "active_data_root": str(self._data_root),
+            "active_data_root_resolved": str(self._data_root.resolve(strict=False)),
+            "active_data_root_device": self._path_device_id(self._data_root),
+            "fallback_data_dir": str(fallback_dir),
+            "fallback_data_dir_resolved": str(fallback_dir.resolve(strict=False)),
+            "fallback_data_dir_exists": fallback_dir.exists(),
+            "fallback_data_dir_device": self._path_device_id(fallback_dir),
+        }
+
+    def _workspace_mount_source(self, container_name: str) -> Path | None:
+        """Return the host source mounted at /root/workspace for one container."""
+        container = self._container_by_name(container_name)
+        container.reload()
+        mounts = container.attrs.get("Mounts", []) or []
+        for mount in mounts:
+            if mount.get("Destination") == "/root/workspace":
+                source = str(mount.get("Source") or "").strip()
+                if source:
+                    return Path(source)
+        return None
+
+    def inspect_workspace_mount(
+        self, username: str, container_name: str
+    ) -> dict[str, Any]:
+        """Inspect whether one container workspace bind mount points at current DATA_DIR."""
+        expected_source = self.get_instance_workspace_dir(
+            username, container_name, create=False
+        )
+        result: dict[str, Any] = {
+            "container_name": container_name,
+            "workspace_destination": "/root/workspace",
+            "expected_source": str(expected_source),
+            "expected_source_resolved": str(expected_source.resolve(strict=False)),
+            "expected_source_exists": expected_source.exists(),
+            "expected_source_device": self._path_device_id(expected_source),
+            "actual_source": None,
+            "actual_source_resolved": None,
+            "actual_source_exists": False,
+            "actual_source_device": None,
+            "source_matches_expected": False,
+            "error": None,
+        }
+        try:
+            actual_source = self._workspace_mount_source(container_name)
+        except RuntimeError as exc:
+            result["error"] = str(exc)
+            return result
+
+        if actual_source is None:
+            result["error"] = "Container has no /root/workspace bind mount."
+            return result
+
+        result["actual_source"] = str(actual_source)
+        result["actual_source_resolved"] = str(actual_source.resolve(strict=False))
+        result["actual_source_exists"] = actual_source.exists()
+        result["actual_source_device"] = self._path_device_id(actual_source)
+        result["source_matches_expected"] = self._paths_same_location(
+            actual_source, expected_source
+        )
+        return result
 
     def _validated_username(self, username: str) -> str:
         """Validate a username before using it in host paths."""
@@ -150,13 +271,20 @@ EOF
                 f"Failed to prepare user workspace directory under {self._data_root}: {exc}"
             ) from exc
 
+    def _user_data_dir(self, username: str, *, create: bool) -> Path:
+        """Return the per-user data directory, optionally creating it."""
+        if create:
+            return self._ensure_user_data_dir(username)
+        safe_username = self._validated_username(username)
+        return self._safe_path(self._data_root, safe_username)
+
     def get_instance_workspace_dir(
         self, username: str, container_name: str, create: bool = True
     ) -> Path:
         """Return the dedicated workspace directory for an instance."""
         safe_container_name = self._validated_segment(container_name, "Container name")
         workspace_dir = self._safe_path(
-            self._ensure_user_data_dir(username), safe_container_name
+            self._user_data_dir(username, create=create), safe_container_name
         )
         if create:
             workspace_dir.mkdir(parents=True, exist_ok=True)

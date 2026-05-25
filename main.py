@@ -954,6 +954,177 @@ def _repair_instance_with_base_image(
         ) from exc
 
 
+def _remount_instance_workspace(
+    db: Session,
+    instance: Instance,
+    user: User,
+    *,
+    original_status_override: str | None = None,
+    original_stopped_at_override: datetime | None = None,
+) -> Instance:
+    """Recreate one stopped container so Docker refreshes its workspace bind source."""
+    instance_obj = cast(Any, instance)
+    user_obj = cast(Any, user)
+    container_name = str(instance_obj.container_name)
+    original_status = str(original_status_override or instance_obj.status)
+    original_stopped_at = (
+        original_stopped_at_override
+        if original_stopped_at_override is not None
+        else instance_obj.stopped_at
+    )
+    mount_info = container_manager.inspect_workspace_mount(
+        str(user_obj.username), container_name
+    )
+    if mount_info.get("source_matches_expected") is True:
+        instance_obj.status = original_status
+        instance_obj.stopped_at = original_stopped_at
+        return instance
+    if mount_info.get("error"):
+        raise RuntimeError(str(mount_info["error"]))
+
+    original_runtime_image = _runtime_image_for_instance(instance)
+    original_snapshot_image = (
+        str(instance_obj.last_snapshot_image_name)
+        if instance_obj.last_snapshot_image_name
+        else None
+    )
+    original_snapshot_at = instance_obj.last_snapshot_at
+    original_gpu_indices = list(instance_obj.gpu_indices)
+    original_memory_gb = int(instance_obj.memory_gb)
+    original_cpu_cores = int(instance_obj.cpu_cores)
+    original_workspace = (
+        Path(str(mount_info["actual_source"]))
+        if mount_info.get("actual_source")
+        else container_manager.locate_instance_workspace_dir(
+            str(user_obj.username), container_name
+        )
+    )
+    target_workspace = container_manager.get_instance_workspace_dir(
+        str(user_obj.username), container_name
+    )
+    new_runtime_image: str | None = None
+
+    if not container_manager.paths_same_location(original_workspace, target_workspace):
+        if container_manager.path_contains(original_workspace, target_workspace):
+            raise RuntimeError(
+                "This instance appears to use a legacy shared workspace. "
+                f"Move the required data from {original_workspace} to "
+                f"{target_workspace} manually before remounting."
+            )
+        if not container_manager.workspace_has_entries(target_workspace):
+            if not original_workspace.exists():
+                raise RuntimeError(
+                    "Current workspace target is empty, but the old workspace source "
+                    f"{original_workspace} is not readable. Migrate workspace data to "
+                    f"{target_workspace} before remounting."
+                )
+            container_manager.copy_workspace(original_workspace, target_workspace)
+
+    try:
+        instance_obj.snapshot_status = "creating"
+        db.flush()
+        new_runtime_image = container_manager.snapshot_container(container_name)
+        instance_obj.last_snapshot_image_name = new_runtime_image
+        instance_obj.last_snapshot_at = datetime.utcnow()
+        instance_obj.snapshot_status = "ready"
+        instance_obj.runtime_image_name = new_runtime_image
+        db.flush()
+    except Exception as exc:
+        instance_obj.snapshot_status = "failed"
+        instance_obj.runtime_image_name = original_runtime_image
+        instance_obj.last_snapshot_image_name = original_snapshot_image
+        instance_obj.last_snapshot_at = original_snapshot_at
+        raise RuntimeError(
+            f"Failed to snapshot instance {container_name}; original container was kept."
+        ) from exc
+
+    try:
+        container_manager.remove_container(container_name)
+    except RuntimeError as exc:
+        instance_obj.runtime_image_name = original_runtime_image
+        instance_obj.last_snapshot_image_name = original_snapshot_image
+        instance_obj.last_snapshot_at = original_snapshot_at
+        instance_obj.snapshot_status = "ready" if original_snapshot_image else "none"
+        try:
+            container_manager.remove_image(str(new_runtime_image))
+        except RuntimeError as cleanup_exc:
+            LOGGER.warning(
+                "Failed to remove unused remount snapshot %s: %s",
+                new_runtime_image,
+                cleanup_exc,
+            )
+        raise RuntimeError(
+            f"Failed to remove original container {container_name}: {exc}"
+        ) from exc
+
+    gpu_manager.release(container_name, db)
+
+    try:
+        _restore_instance_container(
+            db,
+            instance,
+            user,
+            image_name=str(new_runtime_image),
+            gpu_indices=original_gpu_indices,
+            memory_gb=original_memory_gb,
+            cpu_cores=original_cpu_cores,
+            workspace_dir=target_workspace,
+            running=False,
+            stopped_at=original_stopped_at or datetime.utcnow(),
+        )
+        for image_ref in {original_runtime_image, original_snapshot_image}:
+            if image_ref and image_ref != new_runtime_image:
+                _cleanup_snapshot_image_if_unused(
+                    db,
+                    image_ref,
+                    exclude_instance_id=int(instance_obj.id),
+                )
+        return instance
+    except Exception as exc:
+        try:
+            container_manager.remove_container(container_name)
+        except RuntimeError:
+            pass
+        try:
+            _restore_instance_container(
+                db,
+                instance,
+                user,
+                image_name=str(new_runtime_image),
+                gpu_indices=original_gpu_indices,
+                memory_gb=original_memory_gb,
+                cpu_cores=original_cpu_cores,
+                workspace_dir=original_workspace,
+                running=False,
+                stopped_at=original_stopped_at or datetime.utcnow(),
+            )
+            instance_obj.status = original_status
+            instance_obj.stopped_at = original_stopped_at
+        except Exception as rollback_exc:
+            instance_obj.gpu_indices = original_gpu_indices
+            instance_obj.memory_gb = original_memory_gb
+            instance_obj.cpu_cores = original_cpu_cores
+            instance_obj.runtime_image_name = new_runtime_image
+            instance_obj.last_snapshot_image_name = new_runtime_image
+            instance_obj.snapshot_status = "failed"
+            _set_instance_runtime_error(
+                instance,
+                f"Failed to rollback workspace remount: {rollback_exc}",
+            )
+            instance_obj.stopped_at = datetime.utcnow()
+            LOGGER.exception(
+                "Failed to rollback workspace remount for %s: %s",
+                container_name,
+                rollback_exc,
+            )
+            raise RuntimeError(
+                f"Failed to remount workspace for {container_name}; automatic rollback also failed."
+            ) from rollback_exc
+        raise RuntimeError(
+            f"Failed to remount workspace for {container_name}; original mount was restored."
+        ) from exc
+
+
 def _choose_instance_gpu_indices(
     db: Session,
     instance: Instance,
@@ -1989,6 +2160,99 @@ def admin_list_instances(
         query = query.filter(Instance.user_id == user.id)
     instances = query.order_by(Instance.created_at.desc()).all()
     return [_serialize_instance(instance) for instance in instances]
+
+
+@app.get("/api/admin/storage")
+def admin_storage_status(
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Return DATA_DIR and per-instance workspace mount diagnostics."""
+    del admin_user
+    instances = (
+        db.query(Instance)
+        .options(joinedload(Instance.user))
+        .order_by(Instance.created_at.desc())
+        .all()
+    )
+    mount_results: list[dict[str, Any]] = []
+    for instance in instances:
+        instance_obj = cast(Any, instance)
+        user_obj = cast(Any, instance_obj.user)
+        mount_info = container_manager.inspect_workspace_mount(
+            str(user_obj.username), str(instance_obj.container_name)
+        )
+        mount_info["instance_id"] = instance_obj.id
+        mount_info["username"] = user_obj.username
+        mount_info["status"] = instance_obj.status
+        mount_results.append(mount_info)
+    return {
+        "data_root": container_manager.get_data_root_status(),
+        "instances": mount_results,
+    }
+
+
+@app.post("/api/admin/instances/{instance_id}/remount-workspace")
+def admin_remount_instance_workspace(
+    instance_id: int,
+    admin_user: User = Depends(get_admin_user),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Recreate a stopped instance so its workspace bind mount uses current DATA_DIR."""
+    del admin_user
+    instance = (
+        db.query(Instance)
+        .options(joinedload(Instance.user))
+        .filter(Instance.id == instance_id)
+        .first()
+    )
+    if not instance:
+        raise HTTPException(status_code=404, detail="Instance not found.")
+    _ensure_instance_not_rebuilding(instance)
+    if _instance_is_running(instance):
+        raise HTTPException(
+            status_code=400,
+            detail="Stop the instance before remounting its workspace.",
+        )
+
+    instance_obj = cast(Any, instance)
+    original_status = str(instance_obj.status)
+    original_stopped_at = instance_obj.stopped_at
+    instance_obj.status = "rebuilding"
+    db.commit()
+    db.refresh(instance)
+
+    with gpu_manager.locked_allocation():
+        try:
+            remounted_instance = _remount_instance_workspace(
+                db,
+                instance,
+                cast(User, cast(Any, instance).user),
+                original_status_override=original_status,
+                original_stopped_at_override=original_stopped_at,
+            )
+            LOGGER.info(
+                "Remounted workspace for instance %s by admin",
+                cast(Any, remounted_instance).container_name,
+            )
+            db.commit()
+            db.refresh(remounted_instance)
+            return _serialize_instance(remounted_instance)
+        except RuntimeError as exc:
+            if str(instance_obj.status) == "rebuilding":
+                instance_obj.status = original_status
+                instance_obj.stopped_at = original_stopped_at
+            db.commit()
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except Exception as exc:
+            if str(instance_obj.status) == "rebuilding":
+                instance_obj.status = original_status
+                instance_obj.stopped_at = original_stopped_at
+            db.commit()
+            raise HTTPException(
+                status_code=500,
+                detail="Unexpected workspace remount failure.",
+            ) from exc
 
 
 @app.delete("/api/admin/instances/{instance_id}")

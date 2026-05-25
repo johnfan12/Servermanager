@@ -180,6 +180,7 @@ docker build \
 - `INTERNAL_SERVICE_TOKEN`：节点与聚合端服务间调用密钥
 - `DATABASE_URL`：节点 PostgreSQL 连接串
 - `FRP_TOKEN`：frps/frpc 共用 token
+- `DATA_DIR`：实例 workspace 宿主机根目录，推荐固定为稳定挂载点 `/data/users`
 - `FRP_CONTAINER_CONFIG_DIR`：默认 `/etc/frp/containers`
 - `ALLOW_REGISTER`：历史配置，节点本地普通用户注册已废弃
 - Alembic 配置：`alembic.ini`
@@ -223,7 +224,31 @@ curl -s http://127.0.0.1:18881/api/auth/login \
   - 避免并行运行 systemd `frpc-api.service` 与 `start.sh` 内置 frpc-api 客户端。
   - 为每个节点设置唯一 `FRP_API_PROXY_NAME`（如 `servermanager-api-node1`/`servermanager-api-node2`）。
 
-### Q5: 新增实例后旧实例 SSH 掉线
+### Q5: 更换数据盘后容器仍挂载旧盘
+
+Docker bind mount 在容器创建时固定来源，运行中的容器不会因为宿主机换盘、软链切换或重新挂载而自动切到新盘。处理原则：
+
+- 始终把新数据盘挂载到稳定入口，例如 `DATA_DIR=/data/users`，`/etc/fstab` 推荐使用磁盘 `UUID`，不要依赖 `/dev/sdX` 这类会漂移的设备名。
+- 换盘前先停止新建实例入口，再停止受影响实例；换盘后确认 `findmnt -T /data/users` 指向新盘。
+- 使用管理员诊断接口检查实际挂载来源：
+
+```bash
+curl -s http://127.0.0.1:18881/api/admin/storage \
+  -H "Authorization: Bearer <ADMIN_TOKEN>" | python3 -m json.tool
+```
+
+返回中 `source_matches_expected=false` 的实例仍指向旧 workspace 来源，需要重建容器挂载。仅重启 Docker 容器不一定会改掉已记录的旧 source；应先确认 workspace 数据已迁移到新盘，再通过维护流程重建受影响实例。
+
+维护接口可用于停机实例刷新 workspace 挂载：
+
+```bash
+curl -X POST http://127.0.0.1:18881/api/admin/instances/<INSTANCE_ID>/remount-workspace \
+  -H "Authorization: Bearer <ADMIN_TOKEN>"
+```
+
+该接口会要求实例先停机，随后创建容器快照、按当前 `DATA_DIR` 重建同名容器；如果当前目标 workspace 为空且旧来源仍可读，会先复制旧 workspace 数据。
+
+### Q6: 新增实例后旧实例 SSH 掉线
 - 确认你已切换到 per-instance 模式：
   - 节点侧使用 `frpc-container@*.service`
   - VPS 侧使用 `frpc-visitor@*.service`
