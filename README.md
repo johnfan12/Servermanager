@@ -246,7 +246,7 @@ curl -X POST http://127.0.0.1:18881/api/admin/instances/<INSTANCE_ID>/remount-wo
   -H "Authorization: Bearer <ADMIN_TOKEN>"
 ```
 
-该接口会要求实例先停机，随后创建容器快照、按当前 `DATA_DIR` 重建同名容器；如果当前目标 workspace 为空且旧来源仍可读，会先复制旧 workspace 数据。
+该接口会要求实例先停机，随后把刷新任务交给节点后台执行，实例会短暂显示为重建中。后台任务会创建容器快照、按当前 `DATA_DIR` 重建同名容器；如果当前目标 workspace 为空且旧来源仍可读，会先复制旧 workspace 数据。
 
 如果刷新后重连仍看不到 workspace，优先检查两件事：
 

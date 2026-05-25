@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from sqlalchemy import or_
@@ -268,6 +268,7 @@ if CORS_ALLOW_CREDENTIALS and "*" in CORS_ALLOW_ORIGINS:
 container_manager = ContainerManager()
 gpu_manager = GPUManager(SessionLocal)
 scheduler_service = InstanceScheduler(SessionLocal, container_manager, gpu_manager)
+remount_jobs_in_progress: set[int] = set()
 
 
 class LoginRequest(BaseModel):
@@ -1123,6 +1124,61 @@ def _remount_instance_workspace(
         raise RuntimeError(
             f"Failed to remount workspace for {container_name}; original mount was restored."
         ) from exc
+
+
+def _run_remount_instance_workspace_job(
+    instance_id: int,
+    original_status: str,
+    original_stopped_at: datetime | None,
+) -> None:
+    """Run a workspace remount after the admin API has returned."""
+    db = SessionLocal()
+    try:
+        instance = (
+            db.query(Instance)
+            .options(joinedload(Instance.user))
+            .filter(Instance.id == instance_id)
+            .first()
+        )
+        if instance is None:
+            LOGGER.warning("Workspace remount job skipped; instance %s is missing", instance_id)
+            return
+
+        instance_obj = cast(Any, instance)
+        with gpu_manager.locked_allocation():
+            try:
+                remounted_instance = _remount_instance_workspace(
+                    db,
+                    instance,
+                    cast(User, instance_obj.user),
+                    original_status_override=original_status,
+                    original_stopped_at_override=original_stopped_at,
+                )
+                LOGGER.info(
+                    "Remounted workspace for instance %s by admin background job",
+                    cast(Any, remounted_instance).container_name,
+                )
+                db.commit()
+            except Exception as exc:
+                if str(instance_obj.status) == "rebuilding":
+                    instance_obj.status = original_status
+                    instance_obj.stopped_at = original_stopped_at
+                _set_instance_runtime_error(
+                    instance,
+                    f"Workspace remount failed: {exc}",
+                    status=original_status
+                    if original_status in {"stopped", "error", "start_failed"}
+                    else "error",
+                )
+                db.commit()
+                LOGGER.exception(
+                    "Workspace remount background job failed for instance %s: %s",
+                    instance_obj.container_name,
+                    exc,
+                )
+    finally:
+        remount_jobs_in_progress.discard(instance_id)
+        db.close()
 
 
 def _choose_instance_gpu_indices(
@@ -2195,10 +2251,11 @@ def admin_storage_status(
 @app.post("/api/admin/instances/{instance_id}/remount-workspace")
 def admin_remount_instance_workspace(
     instance_id: int,
+    background_tasks: BackgroundTasks,
     admin_user: User = Depends(get_admin_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """Recreate a stopped instance so its workspace bind mount uses current DATA_DIR."""
+    """Schedule a stopped instance remount so Docker refreshes its workspace bind source."""
     del admin_user
     instance = (
         db.query(Instance)
@@ -2208,51 +2265,48 @@ def admin_remount_instance_workspace(
     )
     if not instance:
         raise HTTPException(status_code=404, detail="Instance not found.")
-    _ensure_instance_not_rebuilding(instance)
+
+    if instance_id in remount_jobs_in_progress:
+        raise HTTPException(
+            status_code=409,
+            detail="Workspace remount is already in progress.",
+        )
+
+    instance_obj = cast(Any, instance)
+    current_status = str(instance_obj.status)
+    if current_status == "rebuilding":
+        LOGGER.warning(
+            "Retrying workspace remount for instance %s currently marked rebuilding",
+            instance_obj.container_name,
+        )
+        original_status = "stopped"
+        original_stopped_at = instance_obj.stopped_at or datetime.utcnow()
+    else:
+        original_status = current_status
+        original_stopped_at = instance_obj.stopped_at
+
     if _instance_is_running(instance):
         raise HTTPException(
             status_code=400,
             detail="Stop the instance before remounting its workspace.",
         )
 
-    instance_obj = cast(Any, instance)
-    original_status = str(instance_obj.status)
-    original_stopped_at = instance_obj.stopped_at
     instance_obj.status = "rebuilding"
+    instance_obj.stopped_at = original_stopped_at
+    remount_jobs_in_progress.add(instance_id)
     db.commit()
     db.refresh(instance)
-
-    with gpu_manager.locked_allocation():
-        try:
-            remounted_instance = _remount_instance_workspace(
-                db,
-                instance,
-                cast(User, cast(Any, instance).user),
-                original_status_override=original_status,
-                original_stopped_at_override=original_stopped_at,
-            )
-            LOGGER.info(
-                "Remounted workspace for instance %s by admin",
-                cast(Any, remounted_instance).container_name,
-            )
-            db.commit()
-            db.refresh(remounted_instance)
-            return _serialize_instance(remounted_instance)
-        except RuntimeError as exc:
-            if str(instance_obj.status) == "rebuilding":
-                instance_obj.status = original_status
-                instance_obj.stopped_at = original_stopped_at
-            db.commit()
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        except Exception as exc:
-            if str(instance_obj.status) == "rebuilding":
-                instance_obj.status = original_status
-                instance_obj.stopped_at = original_stopped_at
-            db.commit()
-            raise HTTPException(
-                status_code=500,
-                detail="Unexpected workspace remount failure.",
-            ) from exc
+    background_tasks.add_task(
+        _run_remount_instance_workspace_job,
+        int(instance_id),
+        original_status,
+        original_stopped_at,
+    )
+    LOGGER.info(
+        "Scheduled workspace remount for instance %s by admin",
+        instance_obj.container_name,
+    )
+    return _serialize_instance(instance)
 
 
 @app.delete("/api/admin/instances/{instance_id}")
