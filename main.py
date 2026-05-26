@@ -269,6 +269,7 @@ container_manager = ContainerManager()
 gpu_manager = GPUManager(SessionLocal)
 scheduler_service = InstanceScheduler(SessionLocal, container_manager, gpu_manager)
 remount_jobs_in_progress: set[int] = set()
+instance_jobs_in_progress: set[int] = set()
 
 
 class LoginRequest(BaseModel):
@@ -1181,6 +1182,173 @@ def _run_remount_instance_workspace_job(
         db.close()
 
 
+def _restore_instance_after_background_error(
+    instance: Instance,
+    *,
+    original_status: str,
+    original_stopped_at: datetime | None,
+    detail: str,
+) -> None:
+    """Leave an instance actionable after a failed background lifecycle job."""
+    instance_obj = cast(Any, instance)
+    if str(instance_obj.status) == "rebuilding":
+        instance_obj.status = original_status
+        instance_obj.stopped_at = original_stopped_at
+    instance_obj.last_error = detail
+    instance_obj.last_exit_code = None
+
+
+def _run_rebuild_instance_job(
+    instance_id: int,
+    user_id: int,
+    *,
+    num_gpus: int,
+    memory_gb: int,
+    original_status: str,
+    original_stopped_at: datetime | None,
+    original_gpu_count: int,
+) -> None:
+    """Run an instance rebuild outside the request/response path."""
+    db = SessionLocal()
+    try:
+        instance = (
+            db.query(Instance)
+            .options(joinedload(Instance.user))
+            .filter(Instance.id == instance_id)
+            .first()
+        )
+        user = db.query(User).filter(User.id == user_id).first()
+        if instance is None or user is None:
+            LOGGER.warning(
+                "Rebuild job skipped; instance=%s user=%s is missing",
+                instance_id,
+                user_id,
+            )
+            return
+
+        instance_obj = cast(Any, instance)
+        user_obj = cast(Any, user)
+        with gpu_manager.locked_allocation():
+            try:
+                if num_gpus == original_gpu_count:
+                    rebuilt_instance = _rebuild_instance_in_place(
+                        instance,
+                        new_memory_gb=memory_gb,
+                    )
+                    instance_obj.status = original_status
+                    instance_obj.stopped_at = original_stopped_at
+                    LOGGER.info(
+                        "Updated instance %s in background for user %s with memory %sGB",
+                        instance_obj.container_name,
+                        user_obj.username,
+                        memory_gb,
+                    )
+                else:
+                    selected_gpus = _choose_rebuild_gpu_indices(db, instance, num_gpus)
+                    rebuilt_instance = _rebuild_instance_with_new_gpus(
+                        db,
+                        instance,
+                        user,
+                        selected_gpus,
+                        memory_gb,
+                        original_status_override=original_status,
+                        original_stopped_at_override=original_stopped_at,
+                    )
+                    LOGGER.info(
+                        "Rebuilt instance %s in background for user %s with GPUs %s and memory %sGB",
+                        instance_obj.container_name,
+                        user_obj.username,
+                        selected_gpus,
+                        memory_gb,
+                    )
+                _clear_instance_runtime_error(rebuilt_instance)
+                db.commit()
+            except Exception as exc:
+                _restore_instance_after_background_error(
+                    instance,
+                    original_status=original_status,
+                    original_stopped_at=original_stopped_at,
+                    detail=f"Background rebuild failed: {exc}",
+                )
+                db.commit()
+                LOGGER.exception(
+                    "Background rebuild failed for instance %s: %s",
+                    instance_obj.container_name,
+                    exc,
+                )
+    finally:
+        instance_jobs_in_progress.discard(instance_id)
+        db.close()
+
+
+def _run_repair_instance_job(
+    instance_id: int,
+    user_id: int,
+    *,
+    original_status: str,
+    original_stopped_at: datetime | None,
+) -> None:
+    """Run an instance repair outside the request/response path."""
+    db = SessionLocal()
+    try:
+        instance = (
+            db.query(Instance)
+            .options(joinedload(Instance.user))
+            .filter(Instance.id == instance_id)
+            .first()
+        )
+        user = db.query(User).filter(User.id == user_id).first()
+        if instance is None or user is None:
+            LOGGER.warning(
+                "Repair job skipped; instance=%s user=%s is missing",
+                instance_id,
+                user_id,
+            )
+            return
+
+        instance_obj = cast(Any, instance)
+        user_obj = cast(Any, user)
+        with gpu_manager.locked_allocation():
+            try:
+                target_gpu_indices = _choose_instance_gpu_indices(
+                    db,
+                    instance,
+                    len(list(instance_obj.gpu_indices)),
+                    insufficient_detail="Not enough available GPUs to repair this instance.",
+                )
+                repaired_instance = _repair_instance_with_base_image(
+                    db,
+                    instance,
+                    user,
+                    target_gpu_indices,
+                    original_status_override=original_status,
+                    original_stopped_at_override=original_stopped_at,
+                )
+                _clear_instance_runtime_error(repaired_instance)
+                LOGGER.info(
+                    "Repaired instance %s for user %s in background",
+                    instance_obj.container_name,
+                    user_obj.username,
+                )
+                db.commit()
+            except Exception as exc:
+                _restore_instance_after_background_error(
+                    instance,
+                    original_status=original_status,
+                    original_stopped_at=original_stopped_at,
+                    detail=f"Background repair failed: {exc}",
+                )
+                db.commit()
+                LOGGER.exception(
+                    "Background repair failed for instance %s: %s",
+                    instance_obj.container_name,
+                    exc,
+                )
+    finally:
+        instance_jobs_in_progress.discard(instance_id)
+        db.close()
+
+
 def _choose_instance_gpu_indices(
     db: Session,
     instance: Instance,
@@ -1893,6 +2061,7 @@ def renew_instance(
 def rebuild_instance(
     instance_id: int,
     payload: InstanceRebuildRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
@@ -1923,6 +2092,11 @@ def rebuild_instance(
 
     instance = _get_instance_for_user(db, instance_id, current_user)
     _ensure_instance_not_rebuilding(instance)
+    if instance_id in instance_jobs_in_progress:
+        raise HTTPException(
+            status_code=409,
+            detail="Instance lifecycle operation is already in progress.",
+        )
     instance_obj = cast(Any, instance)
     original_status = str(instance_obj.status)
     original_stopped_at = instance_obj.stopped_at
@@ -1967,77 +2141,45 @@ def rebuild_instance(
         )
 
     instance_obj.status = "rebuilding"
+    instance_obj.stopped_at = original_stopped_at
+    instance_jobs_in_progress.add(instance_id)
     db.commit()
     db.refresh(instance)
-
-    with gpu_manager.locked_allocation():
-        try:
-            if payload.num_gpus == current_gpu_count:
-                rebuilt_instance = _rebuild_instance_in_place(
-                    instance,
-                    new_memory_gb=payload.memory_gb,
-                )
-                instance_obj.status = original_status
-                instance_obj.stopped_at = original_stopped_at
-                LOGGER.info(
-                    "Updated instance %s in place for user %s with memory %sGB",
-                    instance_obj.container_name,
-                    current_user_obj.username,
-                    payload.memory_gb,
-                )
-            else:
-                selected_gpus = _choose_rebuild_gpu_indices(db, instance, payload.num_gpus)
-                rebuilt_instance = _rebuild_instance_with_new_gpus(
-                    db,
-                    instance,
-                    current_user,
-                    selected_gpus,
-                    payload.memory_gb,
-                    original_status_override=original_status,
-                    original_stopped_at_override=original_stopped_at,
-                )
-                LOGGER.info(
-                    "Rebuilt instance %s for user %s with GPUs %s and memory %sGB",
-                    instance_obj.container_name,
-                    current_user_obj.username,
-                    selected_gpus,
-                    payload.memory_gb,
-                )
-            db.commit()
-            db.refresh(rebuilt_instance)
-            return _serialize_instance(rebuilt_instance)
-        except HTTPException:
-            if str(instance_obj.status) == "rebuilding":
-                instance_obj.status = original_status
-                instance_obj.stopped_at = original_stopped_at
-            db.commit()
-            raise
-        except RuntimeError as exc:
-            if str(instance_obj.status) == "rebuilding":
-                instance_obj.status = original_status
-                instance_obj.stopped_at = original_stopped_at
-            db.commit()
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        except Exception as exc:
-            if str(instance_obj.status) == "rebuilding":
-                instance_obj.status = original_status
-                instance_obj.stopped_at = original_stopped_at
-            db.commit()
-            raise HTTPException(
-                status_code=500,
-                detail="Unexpected rebuild failure.",
-            ) from exc
+    background_tasks.add_task(
+        _run_rebuild_instance_job,
+        int(instance_id),
+        int(current_user_obj.id),
+        num_gpus=int(payload.num_gpus),
+        memory_gb=int(payload.memory_gb),
+        original_status=original_status,
+        original_stopped_at=original_stopped_at,
+        original_gpu_count=current_gpu_count,
+    )
+    LOGGER.info(
+        "Scheduled rebuild for instance %s user=%s target_gpus=%s memory=%sGB",
+        instance_obj.container_name,
+        current_user_obj.username,
+        payload.num_gpus,
+        payload.memory_gb,
+    )
+    return _serialize_instance(instance)
 
 
 @app.post("/api/instances/{instance_id}/repair")
 def repair_instance(
     instance_id: int,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
     """Repair one broken instance by recreating it from its base image and workspace."""
     instance = _get_instance_for_user(db, instance_id, current_user)
     _ensure_instance_not_rebuilding(instance)
+    if instance_id in instance_jobs_in_progress:
+        raise HTTPException(
+            status_code=409,
+            detail="Instance lifecycle operation is already in progress.",
+        )
     instance_obj = cast(Any, instance)
     if _instance_is_running(instance):
         raise HTTPException(
@@ -2048,56 +2190,23 @@ def repair_instance(
     original_status = str(instance_obj.status)
     original_stopped_at = instance_obj.stopped_at
     instance_obj.status = "rebuilding"
+    instance_obj.stopped_at = original_stopped_at
+    instance_jobs_in_progress.add(instance_id)
     db.commit()
     db.refresh(instance)
-
-    with gpu_manager.locked_allocation():
-        try:
-            target_gpu_indices = _choose_instance_gpu_indices(
-                db,
-                instance,
-                len(list(instance_obj.gpu_indices)),
-                insufficient_detail="Not enough available GPUs to repair this instance.",
-            )
-            repaired_instance = _repair_instance_with_base_image(
-                db,
-                instance,
-                current_user,
-                target_gpu_indices,
-                original_status_override=original_status,
-                original_stopped_at_override=original_stopped_at,
-            )
-            LOGGER.info(
-                "Repaired instance %s for user %s using base image %s",
-                instance_obj.container_name,
-                cast(Any, current_user).username,
-                cast(Any, repaired_instance).base_image_name
-                or cast(Any, repaired_instance).image_name,
-            )
-            db.commit()
-            db.refresh(repaired_instance)
-            return _serialize_instance(repaired_instance)
-        except HTTPException:
-            if str(instance_obj.status) == "rebuilding":
-                instance_obj.status = original_status
-                instance_obj.stopped_at = original_stopped_at
-            db.commit()
-            raise
-        except RuntimeError as exc:
-            if str(instance_obj.status) == "rebuilding":
-                instance_obj.status = original_status
-                instance_obj.stopped_at = original_stopped_at
-            db.commit()
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        except Exception as exc:
-            if str(instance_obj.status) == "rebuilding":
-                instance_obj.status = original_status
-                instance_obj.stopped_at = original_stopped_at
-            db.commit()
-            raise HTTPException(
-                status_code=500,
-                detail="Unexpected repair failure.",
-            ) from exc
+    background_tasks.add_task(
+        _run_repair_instance_job,
+        int(instance_id),
+        int(cast(Any, current_user).id),
+        original_status=original_status,
+        original_stopped_at=original_stopped_at,
+    )
+    LOGGER.info(
+        "Scheduled repair for instance %s user=%s",
+        instance_obj.container_name,
+        cast(Any, current_user).username,
+    )
+    return _serialize_instance(instance)
 
 
 @app.get("/api/instances/{instance_id}/logs")
