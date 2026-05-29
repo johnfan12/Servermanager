@@ -49,7 +49,7 @@ SIMPLE_ALLOWED_GROUPS=
 
 `SIMPLE_INTERNAL_SERVICE_TOKEN` 必须和简化版 Clustermanager 保持一致。
 `SIMPLE_PUBLIC_HOST` 填纯 IP 或域名，不要带 `http://` 或 `https://`。
-`SIMPLE_GPU_COUNT` 用作 `nvidia-smi` 不可用时的 GPU 数量兜底；真实负载、显存、温度和功耗来自节点机的 `nvidia-smi`。
+`SIMPLE_GPU_COUNT` 用作 `nvidia-smi` 不可用时的 GPU 数量兜底；真实负载、显存、温度和功耗来自节点机的 `nvidia-smi`。简化分支暂无 GPU 分配表，空闲状态按 `power.draw < 50% power.limit` 判断；若功率上限不可用，则用 GPU 利用率小于 10% 兜底。
 
 ## 账号规则
 

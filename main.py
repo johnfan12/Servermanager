@@ -646,6 +646,24 @@ def _query_nvidia_smi() -> list[dict[str, Any]]:
     return gpus
 
 
+def _is_gpu_idle_from_telemetry(live_gpu: dict[str, Any]) -> bool:
+    """Infer idleness without allocation rows in the simplified backend."""
+    power_draw_w = live_gpu.get("power_draw_w")
+    power_limit_w = live_gpu.get("power_limit_w")
+    if (
+        isinstance(power_draw_w, (int, float))
+        and isinstance(power_limit_w, (int, float))
+        and power_limit_w > 0
+    ):
+        return float(power_draw_w) < float(power_limit_w) * 0.5
+
+    utilization_gpu = live_gpu.get("utilization_gpu")
+    if isinstance(utilization_gpu, (int, float)):
+        return float(utilization_gpu) < 10
+
+    return True
+
+
 def get_gpu_status() -> list[dict[str, Any]]:
     """Return GPU status in the same shape as the full Servermanager branch."""
     live_status = _query_nvidia_smi()
@@ -657,11 +675,12 @@ def get_gpu_status() -> list[dict[str, Any]]:
     for gpu_index in range(gpu_count):
         live_gpu = live_map.get(gpu_index, {})
         memory_total_mb = live_gpu.get("memory_total_mb")
+        is_idle = _is_gpu_idle_from_telemetry(live_gpu)
         statuses.append(
             {
                 "index": gpu_index,
-                "status": "free",
-                "is_idle": True,
+                "status": "free" if is_idle else "used",
+                "is_idle": is_idle,
                 "allocated_to": None,
                 "name": live_gpu.get("name") or GPU_MODEL or None,
                 "gpu_model": live_gpu.get("name") or GPU_MODEL or None,
