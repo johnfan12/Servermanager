@@ -80,6 +80,13 @@ def _normalize_public_host(value: str) -> str:
     return candidate
 
 
+def _env_int(name: str, default: int = 0) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
 INTERNAL_SERVICE_TOKEN = os.environ.get("SIMPLE_INTERNAL_SERVICE_TOKEN") or os.environ.get(
     "INTERNAL_SERVICE_TOKEN", "change-this-internal-service-token"
 )
@@ -108,6 +115,8 @@ SSH_LOCAL_HOST = os.environ.get("SIMPLE_SSH_LOCAL_HOST", "127.0.0.1")
 SSH_LOCAL_PORT = int(os.environ.get("SIMPLE_SSH_LOCAL_PORT", "22"))
 SSH_TUNNEL_ENABLED = os.environ.get("SIMPLE_SSH_TUNNEL_ENABLED", "true").lower() == "true"
 SSH_PROXY_NAME = os.environ.get("SIMPLE_SSH_PROXY_NAME", "simple-node-ssh")
+GPU_COUNT = _env_int("SIMPLE_GPU_COUNT", _env_int("GPU_COUNT", 0))
+GPU_MODEL = os.environ.get("SIMPLE_GPU_MODEL", os.environ.get("GPU_MODEL", "")).strip()
 ALLOW_CUSTOM_TUNNELS = os.environ.get("SIMPLE_ALLOW_CUSTOM_TUNNELS", "false").lower() == "true"
 ALLOW_NON_LOOPBACK = os.environ.get("SIMPLE_ALLOW_NON_LOOPBACK", "false").lower() == "true"
 REQUIRE_LISTENING_LOCAL_PORT = (
@@ -214,6 +223,12 @@ def _require_internal_principal(
         raise HTTPException(status_code=403, detail="User is not a local account on this node.")
     is_admin = x_user_is_admin.lower() in {"1", "true", "yes", "on"} or is_admin_username(username)
     return Principal(username=username, is_admin=is_admin)
+
+
+def _require_internal_token(
+    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+) -> None:
+    verify_internal_token(x_internal_token, INTERNAL_SERVICE_TOKEN)
 
 
 def _ensure_local_host_allowed(local_host: str) -> None:
@@ -563,6 +578,109 @@ def _serialize_fixed_ssh_access(principal: Principal, status: str = "active", er
     }
 
 
+def _parse_nvidia_int(value: str) -> int | None:
+    normalized = value.strip()
+    if not normalized or normalized.upper() in {"N/A", "[N/A]"}:
+        return None
+    try:
+        return int(float(normalized))
+    except ValueError:
+        return None
+
+
+def _parse_nvidia_float(value: str) -> float | None:
+    normalized = value.strip()
+    if not normalized or normalized.upper() in {"N/A", "[N/A]"}:
+        return None
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def _query_nvidia_smi() -> list[dict[str, Any]]:
+    """Query live GPU telemetry from nvidia-smi."""
+    command = [
+        "nvidia-smi",
+        (
+            "--query-gpu=index,name,memory.total,memory.used,utilization.gpu,"
+            "temperature.gpu,power.draw,power.limit"
+        ),
+        "--format=csv,noheader,nounits",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    except FileNotFoundError:
+        LOGGER.warning("nvidia-smi not found; GPU status is unavailable.")
+        return []
+    except subprocess.SubprocessError as exc:
+        LOGGER.warning("Failed to query nvidia-smi: %s", exc)
+        return []
+
+    gpus: list[dict[str, Any]] = []
+    for line in result.stdout.strip().splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) != 8:
+            continue
+        gpu_index = _parse_nvidia_int(parts[0])
+        if gpu_index is None:
+            continue
+        gpus.append(
+            {
+                "index": gpu_index,
+                "name": parts[1] or GPU_MODEL or None,
+                "memory_total_mb": _parse_nvidia_int(parts[2]),
+                "memory_used_mb": _parse_nvidia_int(parts[3]),
+                "utilization_gpu": _parse_nvidia_int(parts[4]),
+                "temperature_c": _parse_nvidia_int(parts[5]),
+                "power_draw_w": _parse_nvidia_float(parts[6]),
+                "power_limit_w": _parse_nvidia_float(parts[7]),
+            }
+        )
+    return gpus
+
+
+def get_gpu_status() -> list[dict[str, Any]]:
+    """Return GPU status in the same shape as the full Servermanager branch."""
+    live_status = _query_nvidia_smi()
+    live_map = {int(gpu["index"]): gpu for gpu in live_status}
+    detected_count = max(live_map.keys(), default=-1) + 1
+    gpu_count = max(GPU_COUNT, detected_count)
+
+    statuses: list[dict[str, Any]] = []
+    for gpu_index in range(gpu_count):
+        live_gpu = live_map.get(gpu_index, {})
+        memory_total_mb = live_gpu.get("memory_total_mb")
+        statuses.append(
+            {
+                "index": gpu_index,
+                "status": "free",
+                "is_idle": True,
+                "allocated_to": None,
+                "name": live_gpu.get("name") or GPU_MODEL or None,
+                "gpu_model": live_gpu.get("name") or GPU_MODEL or None,
+                "memory_total_mb": memory_total_mb,
+                "memory_used_mb": live_gpu.get("memory_used_mb"),
+                "memory_total_gb": (
+                    int(memory_total_mb) // 1024
+                    if isinstance(memory_total_mb, int)
+                    else None
+                ),
+                "utilization_gpu": live_gpu.get("utilization_gpu"),
+                "temperature_c": live_gpu.get("temperature_c"),
+                "power_draw_w": live_gpu.get("power_draw_w"),
+                "power_limit_w": live_gpu.get("power_limit_w"),
+            }
+        )
+    return statuses
+
+
 def _visible_tunnels(db: Session, principal: Principal, include_all: bool = False) -> list[SimpleTunnel]:
     statement = select(SimpleTunnel).order_by(SimpleTunnel.created_at.desc(), SimpleTunnel.id.desc())
     if not (principal.is_admin and include_all):
@@ -705,6 +823,11 @@ def list_tunnels(
 ) -> dict[str, Any]:
     del include_all, db
     return {"tunnels": [_serialize_fixed_ssh_access(principal)]}
+
+
+@app.get("/api/gpus/status")
+def gpu_status(_: None = Depends(_require_internal_token)) -> list[dict[str, Any]]:
+    return get_gpu_status()
 
 
 @app.post("/api/tunnels")

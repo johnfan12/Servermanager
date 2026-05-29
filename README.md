@@ -38,6 +38,8 @@ SIMPLE_API_REMOTE_PORT=18881
 
 SIMPLE_SSH_TUNNEL_ENABLED=true
 SIMPLE_SSH_REMOTE_PORT=30000
+SIMPLE_GPU_COUNT=1
+SIMPLE_GPU_MODEL=RTX 4090
 SIMPLE_SSH_LOCAL_HOST=127.0.0.1
 SIMPLE_SSH_LOCAL_PORT=22
 SIMPLE_ALLOW_NON_LOOPBACK=false
@@ -47,6 +49,7 @@ SIMPLE_ALLOWED_GROUPS=
 
 `SIMPLE_INTERNAL_SERVICE_TOKEN` 必须和简化版 Clustermanager 保持一致。
 `SIMPLE_PUBLIC_HOST` 填纯 IP 或域名，不要带 `http://` 或 `https://`。
+`SIMPLE_GPU_COUNT` 用作 `nvidia-smi` 不可用时的 GPU 数量兜底；真实负载、显存、温度和功耗来自节点机的 `nvidia-smi`。
 
 ## 账号规则
 
@@ -65,6 +68,7 @@ PAM 依赖可用 `pip install python-pam` 安装；部分系统也可以使用�
 - `POST /api/login`
 - `GET /api/auth/me`
 - `GET /api/tunnels`
+- `GET /api/gpus/status`
 - `GET /api/ssh-access`
 - `GET /api/internal/tunnels`
 - `GET /api/internal/ssh-access`
