@@ -14,6 +14,7 @@ import signal
 import subprocess
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -63,11 +64,28 @@ engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True, connect_ar
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 Base = declarative_base()
 
+
+def _normalize_public_host(value: str) -> str:
+    candidate = value.strip()
+    if not candidate:
+        return "127.0.0.1"
+    if "://" in candidate:
+        parsed = urlparse(candidate)
+        return parsed.hostname or parsed.netloc or candidate
+    candidate = candidate.split("/", 1)[0]
+    if candidate.count(":") == 1:
+        host, port = candidate.rsplit(":", 1)
+        if port.isdigit():
+            return host
+    return candidate
+
+
 INTERNAL_SERVICE_TOKEN = os.environ.get("SIMPLE_INTERNAL_SERVICE_TOKEN") or os.environ.get(
     "INTERNAL_SERVICE_TOKEN", "change-this-internal-service-token"
 )
-PUBLIC_HOST = os.environ.get("SIMPLE_PUBLIC_HOST") or os.environ.get(
-    "SERVER_IP", os.environ.get("FRP_SERVER_ADDR", "127.0.0.1")
+PUBLIC_HOST = _normalize_public_host(
+    os.environ.get("SIMPLE_PUBLIC_HOST")
+    or os.environ.get("SERVER_IP", os.environ.get("FRP_SERVER_ADDR", "127.0.0.1"))
 )
 FRP_ENABLED = os.environ.get("SIMPLE_FRP_ENABLED", os.environ.get("FRP_ENABLED", "true")).lower() == "true"
 FRP_SERVER_ADDR = os.environ.get("SIMPLE_FRP_SERVER_ADDR") or os.environ.get(
@@ -86,6 +104,9 @@ FRPC_LOG_FILE = Path(
     os.environ.get("SIMPLE_FRPC_LOG_FILE", str(LOG_DIR / "simple-frpc-tunnels.log"))
 )
 REMOTE_PORT_RANGE_RAW = os.environ.get("SIMPLE_TUNNEL_REMOTE_PORT_RANGE", "30000-39999")
+SSH_LOCAL_HOST = os.environ.get("SIMPLE_SSH_LOCAL_HOST", "127.0.0.1")
+SSH_LOCAL_PORT = int(os.environ.get("SIMPLE_SSH_LOCAL_PORT", "22"))
+ALLOW_CUSTOM_TUNNELS = os.environ.get("SIMPLE_ALLOW_CUSTOM_TUNNELS", "false").lower() == "true"
 ALLOW_NON_LOOPBACK = os.environ.get("SIMPLE_ALLOW_NON_LOOPBACK", "false").lower() == "true"
 REQUIRE_LISTENING_LOCAL_PORT = (
     os.environ.get("SIMPLE_REQUIRE_LISTENING_LOCAL_PORT", "false").lower() == "true"
@@ -124,11 +145,11 @@ class LoginRequest(BaseModel):
 
 
 class TunnelCreateRequest(BaseModel):
-    """Create one TCP tunnel to a local service."""
+    """Create one SSH tunnel to the local server by default."""
 
     name: str | None = Field(default=None, max_length=64)
-    local_host: str = Field(default="127.0.0.1", min_length=1, max_length=255)
-    local_port: int = Field(ge=1, le=65535)
+    local_host: str = Field(default=SSH_LOCAL_HOST, min_length=1, max_length=255)
+    local_port: int = Field(default=SSH_LOCAL_PORT, ge=1, le=65535)
     remote_port: int | None = Field(default=None, ge=1, le=65535)
 
     @field_validator("name")
@@ -219,6 +240,16 @@ def _is_port_listening(host: str, port: int) -> bool:
 
 def _validate_tunnel_request(payload: TunnelCreateRequest) -> None:
     _ensure_local_host_allowed(payload.local_host)
+    if not ALLOW_CUSTOM_TUNNELS and (
+        payload.local_host != SSH_LOCAL_HOST or payload.local_port != SSH_LOCAL_PORT
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Only SSH access is allowed by default. "
+                "Set SIMPLE_ALLOW_CUSTOM_TUNNELS=true to expose other local ports."
+            ),
+        )
     if REQUIRE_LISTENING_LOCAL_PORT and not _is_port_listening(payload.local_host, payload.local_port):
         raise HTTPException(status_code=400, detail="The local port is not listening.")
 
@@ -385,6 +416,7 @@ def _set_tunnel_status(
 
 def _serialize_tunnel(tunnel: SimpleTunnel) -> dict[str, Any]:
     address = f"{PUBLIC_HOST}:{tunnel.remote_port}"
+    ssh_command = f"ssh -p {tunnel.remote_port} {tunnel.owner}@{PUBLIC_HOST}"
     return {
         "id": int(tunnel.id),
         "owner": str(tunnel.owner),
@@ -396,6 +428,8 @@ def _serialize_tunnel(tunnel: SimpleTunnel) -> dict[str, Any]:
         "remote_port": int(tunnel.remote_port),
         "address": address,
         "url": address,
+        "ssh_command": ssh_command,
+        "target": "ssh" if tunnel.local_port == SSH_LOCAL_PORT else "tcp",
         "status": str(tunnel.status),
         "error": tunnel.error,
         "created_at": tunnel.created_at.isoformat(),
@@ -417,7 +451,7 @@ def _create_tunnel(
 ) -> SimpleTunnel:
     _validate_tunnel_request(payload)
     remote_port = _allocate_remote_port(db, payload.remote_port)
-    name = payload.name or f"port-{payload.local_port}"
+    name = payload.name or "ssh"
     tunnel = SimpleTunnel(
         owner=principal.username,
         name=name,
