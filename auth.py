@@ -1,149 +1,166 @@
-"""Authentication and authorization helpers."""
+"""Local Linux account authentication helpers for the simplified server."""
 
-from datetime import datetime, timedelta
-from typing import Any
+from __future__ import annotations
 
-from fastapi import Depends, HTTPException, status
-from fastapi.security import OAuth2PasswordBearer
+import grp
+import hmac
+import os
+import pwd
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
-from passlib.context import CryptContext
-from sqlalchemy.orm import Session
 
-from config import (
-    ADMIN_PASSWORD,
-    ADMIN_USERNAME,
-    JWT_EXPIRE_HOURS,
-    JWT_SECRET,
+JWT_SECRET = os.environ.get("SIMPLE_JWT_SECRET") or os.environ.get(
+    "JWT_SECRET", "change-this-simple-secret"
 )
-from database import get_db
-from models import User
+JWT_ALGORITHM = os.environ.get("SIMPLE_JWT_ALGORITHM", "HS256")
+JWT_EXPIRE_HOURS = int(os.environ.get("SIMPLE_JWT_EXPIRE_HOURS", "24"))
+PAM_SERVICE = os.environ.get("SIMPLE_PAM_SERVICE", "login")
+ALLOW_SYSTEM_USERS = os.environ.get("SIMPLE_ALLOW_SYSTEM_USERS", "false").lower() == "true"
+ALLOWED_UID_MIN = int(os.environ.get("SIMPLE_ALLOWED_UID_MIN", "1000"))
+ALLOWED_GROUPS = {
+    item.strip()
+    for item in os.environ.get("SIMPLE_ALLOWED_GROUPS", "").split(",")
+    if item.strip()
+}
+ADMIN_USERS = {
+    item.strip()
+    for item in os.environ.get("SIMPLE_ADMIN_USERS", "").split(",")
+    if item.strip()
+}
+ADMIN_GROUPS = {
+    item.strip()
+    for item in os.environ.get("SIMPLE_ADMIN_GROUPS", "sudo,wheel").split(",")
+    if item.strip()
+}
 
-pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
-SHADOW_EMAIL_DOMAIN = "shadow.local"
-
-
-def hash_password(password: str) -> str:
-    """Hash a plaintext password."""
-    return pwd_context.hash(password)
-
-
-def verify_password(plain_password: str, password_hash: str) -> bool:
-    """Verify a plaintext password against a stored hash."""
-    return pwd_context.verify(plain_password, password_hash)
-
-
-def build_shadow_password_hash(subject: str) -> str:
-    """Create one non-interactive password hash for a node shadow user."""
-    return hash_password(f"shadow-only::{subject}::{JWT_SECRET}")
-
-
-def create_access_token(
-    subject: str,
-    expires_delta: timedelta | None = None,
-    *,
-    is_admin: bool = False,
-    email: str | None = None,
-) -> str:
-    """Create a signed JWT for the given subject."""
-    expire = datetime.utcnow() + (expires_delta or timedelta(hours=JWT_EXPIRE_HOURS))
-    payload: dict[str, Any] = {"sub": subject, "exp": expire, "is_admin": is_admin}
-    if email:
-        payload["email"] = email
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+security = HTTPBearer(auto_error=False)
 
 
-def _resolve_shadow_email(db: Session, username: str, email: str | None) -> str:
-    """Return one safe email for a node shadow user, avoiding unique conflicts."""
-    normalized = str(email or "").strip().lower()
-    candidate = normalized or f"{username}@{SHADOW_EMAIL_DOMAIN}"
-    existing = db.query(User).filter(User.email == candidate).first()
-    if existing is None or existing.username == username:
-        return candidate
-    return f"{username}@{SHADOW_EMAIL_DOMAIN}"
+@dataclass(frozen=True)
+class Principal:
+    """Authenticated local account."""
+
+    username: str
+    is_admin: bool = False
 
 
-def ensure_shadow_user(
-    db: Session,
-    username: str,
-    *,
-    is_admin: bool,
-    email: str | None = None,
-) -> User:
-    """Create or refresh one node shadow user from trusted JWT claims."""
-    user = db.query(User).filter(User.username == username).first()
-    resolved_email = _resolve_shadow_email(db, username, email)
-    changed = False
-
-    if user is None:
-        user = User(
-            username=username,
-            email=resolved_email,
-            password_hash=build_shadow_password_hash(username),
-            is_admin=is_admin,
-        )
-        db.add(user)
-        changed = True
-    else:
-        if user.is_admin != is_admin:
-            user.is_admin = is_admin
-            changed = True
-        if resolved_email and user.email != resolved_email:
-            user.email = resolved_email
-            changed = True
-
-    if changed:
-        db.commit()
-        db.refresh(user)
-    return user
-
-
-def get_current_user(
-    db: Session = Depends(get_db), token: str = Depends(oauth2_scheme)
-) -> User:
-    """Return the currently authenticated user from the JWT token."""
-    credentials_error = HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid authentication credentials.",
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+def _local_user(username: str) -> pwd.struct_passwd | None:
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        username = payload.get("sub")
-        if not username:
-            raise credentials_error
-    except JWTError as exc:
-        raise credentials_error from exc
-
-    return ensure_shadow_user(
-        db,
-        str(username),
-        is_admin=bool(payload.get("is_admin", username == ADMIN_USERNAME)),
-        email=payload.get("email"),
-    )
+        return pwd.getpwnam(username)
+    except KeyError:
+        return None
 
 
-def get_admin_user(current_user: User = Depends(get_current_user)) -> User:
-    """Ensure the current user has administrator privileges."""
-    if not current_user.is_admin:
+def _user_groups(username: str, primary_gid: int) -> set[str]:
+    groups: set[str] = set()
+    try:
+        groups.add(grp.getgrgid(primary_gid).gr_name)
+    except KeyError:
+        pass
+
+    for group in grp.getgrall():
+        if username in group.gr_mem:
+            groups.add(group.gr_name)
+    return groups
+
+
+def is_admin_username(username: str) -> bool:
+    """Return whether the local account should be treated as an admin."""
+    user = _local_user(username)
+    if user is None:
+        return False
+    if username in ADMIN_USERS:
+        return True
+    return bool(_user_groups(username, user.pw_gid) & ADMIN_GROUPS)
+
+
+def is_local_user_allowed(username: str) -> bool:
+    """Return whether a local account is allowed to use the simplified service."""
+    user = _local_user(username)
+    if user is None:
+        return False
+
+    if not ALLOW_SYSTEM_USERS and user.pw_uid < ALLOWED_UID_MIN and username not in ADMIN_USERS:
+        return False
+
+    shell = str(user.pw_shell or "")
+    if shell.endswith(("nologin", "false")):
+        return False
+
+    if ALLOWED_GROUPS and not (_user_groups(username, user.pw_gid) & ALLOWED_GROUPS):
+        return False
+
+    return True
+
+
+def authenticate_local_user(username: str, password: str) -> Principal:
+    """Authenticate a username/password pair against the host PAM stack."""
+    username = username.strip()
+    if not username or not password:
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+    if not is_local_user_allowed(username):
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+
+    try:
+        import pam  # type: ignore[import-not-found]
+    except ImportError as exc:
         raise HTTPException(
-            status_code=403, detail="Administrator privileges are required."
+            status_code=500,
+            detail="PAM authentication is unavailable. Install python-pam or python3-pam.",
+        ) from exc
+
+    try:
+        if hasattr(pam, "pam"):
+            pam_client = pam.pam()
+            authenticated = pam_client.authenticate(username, password, service=PAM_SERVICE)
+        else:
+            authenticated = pam.authenticate(username, password, service=PAM_SERVICE)
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Invalid username or password.") from exc
+
+    if not authenticated:
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+    return Principal(username=username, is_admin=is_admin_username(username))
+
+
+def create_access_token(principal: Principal) -> str:
+    """Create a short-lived JWT for the local account."""
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
+    payload = {
+        "sub": principal.username,
+        "is_admin": principal.is_admin,
+        "exp": expires_at,
+        "scope": "simple-servermanager",
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def get_current_principal(
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+) -> Principal:
+    """Read the bearer token and return the current local principal."""
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Authentication required.")
+    try:
+        payload = jwt.decode(
+            credentials.credentials,
+            JWT_SECRET,
+            algorithms=[JWT_ALGORITHM],
         )
-    return current_user
+    except JWTError as exc:
+        raise HTTPException(status_code=401, detail="Invalid or expired token.") from exc
+
+    username = str(payload.get("sub") or "")
+    if not is_local_user_allowed(username):
+        raise HTTPException(status_code=401, detail="Local account is not allowed.")
+    return Principal(username=username, is_admin=bool(payload.get("is_admin")))
 
 
-def ensure_default_admin(db: Session) -> None:
-    """Create the default administrator account when it does not exist."""
-    admin = db.query(User).filter(User.username == ADMIN_USERNAME).first()
-    if admin:
-        return
-
-    db.add(
-        User(
-            username=ADMIN_USERNAME,
-            password_hash=hash_password(ADMIN_PASSWORD),
-            email=f"{ADMIN_USERNAME}@local",
-            is_admin=True,
-        )
-    )
-    db.commit()
+def verify_internal_token(received: str | None, expected: str) -> None:
+    """Validate service-to-service requests without leaking timing details."""
+    if not expected or not received or not hmac.compare_digest(received, expected):
+        raise HTTPException(status_code=401, detail="Invalid internal token.")

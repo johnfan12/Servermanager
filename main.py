@@ -1,2712 +1,603 @@
-"""FastAPI application for managing multi-user GPU container instances."""
+"""Simplified node backend for exposing local services through FRP tunnels."""
 
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-import asyncio
+from datetime import datetime
+import ipaddress
 import logging
-import secrets
-from datetime import datetime, timedelta
+import os
 from pathlib import Path
-from typing import Any, cast
+import re
+import shutil
+import signal
+import subprocess
+import time
+from typing import Any
 
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from sqlalchemy import or_
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from auth import (
-    build_shadow_password_hash,
+    Principal,
+    authenticate_local_user,
     create_access_token,
-    ensure_default_admin,
-    get_admin_user,
-    get_current_user,
-    verify_password,
+    get_current_principal,
+    is_admin_username,
+    is_local_user_allowed,
+    verify_internal_token,
 )
-from config import (
-    CORS_ALLOW_CREDENTIALS,
-    CORS_ALLOW_ORIGINS,
-    ENV,
-    GPU_COUNT,
-    INSTANCE_MEMORY_OPTIONS_GB,
-    INTERNAL_SERVICE_TOKEN,
-    JWT_SECRET,
-    LOG_DIR,
-    MAX_INSTANCE_MEMORY_GB,
-    NODE_ALLOCATABLE_MEMORY_GB,
-    SERVER_IP,
-)
-from container_manager import ContainerManager
-from database import SessionLocal, get_db, init_db
-from gpu_manager import GPUManager
-from models import GPUAllocation, Instance, User, UserSSHKey
-from scheduler import InstanceScheduler
 
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+LOG_DIR = BASE_DIR / os.environ.get("SIMPLE_LOG_DIR", "logs")
+RUNTIME_DIR = BASE_DIR / os.environ.get("SIMPLE_RUNTIME_DIR", "runtime")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
     handlers=[
-        logging.FileHandler(LOG_DIR / "app.log"),
+        logging.FileHandler(LOG_DIR / "simple-servermanager.log"),
         logging.StreamHandler(),
     ],
 )
-LOGGER = logging.getLogger(__name__)
-DISPLAY_NAME_MAX_LENGTH = 64
-CPU_ONLY_GPU_COUNT = 0
-DEFAULT_AUTO_STOP_HOURS = 6
-MIN_AUTO_STOP_HOURS = 1
-MAX_AUTO_STOP_HOURS = 72
+LOGGER = logging.getLogger("simple_servermanager")
 
-
-class InstanceStateChangedError(RuntimeError):
-    """Raised after container state changed and DB state should be preserved."""
-
-
-def _unique_name(prefix: str) -> str:
-    """Return a collision-resistant resource name."""
-    return f"{prefix}_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{secrets.token_hex(3)}"
-
-
-def _normalize_display_name(value: str | None) -> str | None:
-    """Normalize an optional user-facing instance name."""
-    if value is None:
-        return None
-    normalized = value.strip()
-    if not normalized:
-        return None
-    if len(normalized) > DISPLAY_NAME_MAX_LENGTH:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Instance name cannot exceed {DISPLAY_NAME_MAX_LENGTH} characters.",
-        )
-    if any(ord(char) < 32 for char in normalized):
-        raise HTTPException(status_code=400, detail="Instance name contains control characters.")
-    return normalized
-
-
-def _is_selectable_base_image(image_ref: str | None) -> bool:
-    """Return whether an image may be selected as a new instance base image."""
-    return not container_manager.is_snapshot_image(image_ref)
-
-
-def _minimum_instance_memory_gb() -> int:
-    """Return the lowest configured instance memory option."""
-    return min(INSTANCE_MEMORY_OPTIONS_GB)
-
-
-def _is_cpu_only_min_memory(num_gpus: int, memory_gb: int) -> bool:
-    """Return whether a request qualifies for CPU-only minimum-memory fallback."""
-    return num_gpus == CPU_ONLY_GPU_COUNT and memory_gb == _minimum_instance_memory_gb()
-
-
-def _enforce_cpu_only_min_memory(num_gpus: int, memory_gb: int) -> None:
-    """Require CPU-only instances to use the lowest configured memory tier."""
-    if num_gpus == CPU_ONLY_GPU_COUNT and memory_gb != _minimum_instance_memory_gb():
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "CPU-only instances must use the minimum memory option: "
-                f"{_minimum_instance_memory_gb()} GB."
-            ),
-        )
-
-
-def _gpu_memory_limit_gb(num_gpus: int) -> float | None:
-    """Return the memory ceiling for a GPU-backed instance."""
-    if num_gpus <= CPU_ONLY_GPU_COUNT or GPU_COUNT <= 0:
-        return None
-    return NODE_ALLOCATABLE_MEMORY_GB * num_gpus / GPU_COUNT
-
-
-def _format_memory_limit(limit_gb: float) -> str:
-    """Format a memory limit for API error messages."""
-    return f"{limit_gb:.2f}".rstrip("0").rstrip(".")
-
-
-def _enforce_gpu_memory_limit(num_gpus: int, memory_gb: int) -> None:
-    """Limit memory by selected GPU share: num_gpus * total_memory / total_gpus."""
-    limit_gb = _gpu_memory_limit_gb(num_gpus)
-    if limit_gb is not None and memory_gb > limit_gb:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Memory cannot exceed {_format_memory_limit(limit_gb)} GB "
-                f"when selecting {num_gpus} GPU(s)."
-            ),
-        )
-
-
-def _default_auto_stop_hours(instance: Instance | None = None) -> int:
-    """Return a safe auto-stop duration for one instance."""
-    if instance is None:
-        return DEFAULT_AUTO_STOP_HOURS
-    raw_value = getattr(cast(Any, instance), "auto_stop_hours", None)
-    try:
-        hours = int(raw_value)
-    except (TypeError, ValueError):
-        return DEFAULT_AUTO_STOP_HOURS
-    return max(MIN_AUTO_STOP_HOURS, min(MAX_AUTO_STOP_HOURS, hours))
-
-
-def _resolve_auto_stop_hours(*candidates: int | None, default: int | None = None) -> int:
-    """Pick the first valid auto-stop duration from request fields."""
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        hours = int(candidate)
-        if hours < MIN_AUTO_STOP_HOURS or hours > MAX_AUTO_STOP_HOURS:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "Auto-stop hours must be between "
-                    f"{MIN_AUTO_STOP_HOURS} and {MAX_AUTO_STOP_HOURS}."
-                ),
-            )
-        return hours
-    if default is None:
-        raise HTTPException(status_code=400, detail="Auto-stop hours are required.")
-    return _resolve_auto_stop_hours(default)
-
-
-def _calculate_auto_stop_at(hours: int, *, now: datetime | None = None) -> datetime:
-    """Return one auto-stop deadline relative to now."""
-    return (now or datetime.utcnow()) + timedelta(hours=hours)
-
-
-def _set_instance_auto_stop(
-    instance: Instance,
-    hours: int,
-    *,
-    now: datetime | None = None,
-) -> None:
-    """Store the current auto-stop duration and its active deadline."""
-    instance_obj = cast(Any, instance)
-    instance_obj.auto_stop_hours = hours
-    instance_obj.expire_at = _calculate_auto_stop_at(hours, now=now)
-
-
-def _clear_instance_auto_stop(instance: Instance) -> None:
-    """End the active auto-stop timer for one stopped instance."""
-    cast(Any, instance).expire_at = None
-
-
-def _clear_instance_runtime_error(instance: Instance) -> None:
-    """Drop the last recorded runtime failure for one instance."""
-    instance_obj = cast(Any, instance)
-    instance_obj.last_error = None
-    instance_obj.last_exit_code = None
-
-
-def _set_instance_runtime_error(
-    instance: Instance,
-    detail: str,
-    *,
-    status: str = "error",
-    exit_code: int | None = None,
-) -> None:
-    """Persist one instance runtime failure for later display."""
-    instance_obj = cast(Any, instance)
-    instance_obj.status = status
-    instance_obj.last_error = detail
-    instance_obj.last_exit_code = exit_code
-
-
-@asynccontextmanager
-async def lifespan(application: FastAPI):
-    """Initialize and tear down persistent services around app lifetime."""
-    del application
-    if JWT_SECRET == "change-this-secret":
-        LOGGER.warning(
-            "JWT_SECRET is using the default insecure value. Set environment variable JWT_SECRET in production."
-        )
-    if ENV == "prod":
-        LOGGER.info("Running in production mode with strict config checks")
-    init_db()
-    db = SessionLocal()
-    try:
-        ensure_default_admin(db)
-    finally:
-        db.close()
-    scheduler_service.start()
-
-    # 启动时同步 FRP 配置
-    try:
-        container_manager.frp_manager.sync_api_client_config()
-    except Exception as exc:
-        LOGGER.warning("Failed to sync FRP API config on startup: %s", exc)
-
-    try:
-        container_manager.sync_frp_config()
-    except Exception as exc:
-        LOGGER.warning("Failed to sync FRP config on startup: %s", exc)
-
-    try:
-        yield
-    finally:
-        scheduler_service.shutdown()
-
-
-app = FastAPI(title="GPU Server Manager", lifespan=lifespan)
-
-# cluster_manager 适配：添加 CORS 中间件，允许来自 cluster_manager 前端域名的跨域请求
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=list(CORS_ALLOW_ORIGINS),
-    allow_credentials=CORS_ALLOW_CREDENTIALS,
-    allow_methods=["*"],
-    allow_headers=["*"],
+DATABASE_URL = os.environ.get(
+    "SIMPLE_DATABASE_URL",
+    f"sqlite:///{BASE_DIR / 'simple_servermanager.db'}",
 )
+connect_args: dict[str, Any] = {}
+if DATABASE_URL.startswith("sqlite"):
+    connect_args["check_same_thread"] = False
 
-if CORS_ALLOW_CREDENTIALS and "*" in CORS_ALLOW_ORIGINS:
-    raise RuntimeError(
-        "Invalid CORS configuration: cannot use wildcard origin when credentials are enabled."
-    )
+engine = create_engine(DATABASE_URL, future=True, pool_pre_ping=True, connect_args=connect_args)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
+Base = declarative_base()
 
-container_manager = ContainerManager()
-gpu_manager = GPUManager(SessionLocal)
-scheduler_service = InstanceScheduler(SessionLocal, container_manager, gpu_manager)
-remount_jobs_in_progress: set[int] = set()
-instance_jobs_in_progress: set[int] = set()
+INTERNAL_SERVICE_TOKEN = os.environ.get("SIMPLE_INTERNAL_SERVICE_TOKEN") or os.environ.get(
+    "INTERNAL_SERVICE_TOKEN", "change-this-internal-service-token"
+)
+PUBLIC_HOST = os.environ.get("SIMPLE_PUBLIC_HOST") or os.environ.get(
+    "SERVER_IP", os.environ.get("FRP_SERVER_ADDR", "127.0.0.1")
+)
+FRP_ENABLED = os.environ.get("SIMPLE_FRP_ENABLED", os.environ.get("FRP_ENABLED", "true")).lower() == "true"
+FRP_SERVER_ADDR = os.environ.get("SIMPLE_FRP_SERVER_ADDR") or os.environ.get(
+    "FRP_SERVER_ADDR", "127.0.0.1"
+)
+FRP_SERVER_PORT = int(os.environ.get("SIMPLE_FRP_SERVER_PORT", os.environ.get("FRP_SERVER_PORT", "7000")))
+FRP_TOKEN = os.environ.get("SIMPLE_FRP_TOKEN") or os.environ.get("FRP_TOKEN", "")
+FRP_CLIENT_BIN = os.environ.get("SIMPLE_FRP_CLIENT_BIN") or os.environ.get("FRP_CLIENT_BIN", "frpc")
+FRPC_CONFIG_FILE = Path(
+    os.environ.get("SIMPLE_FRPC_CONFIG_FILE", str(RUNTIME_DIR / "simple-frpc-tunnels.ini"))
+)
+FRPC_PID_FILE = Path(
+    os.environ.get("SIMPLE_FRPC_PID_FILE", str(RUNTIME_DIR / "simple-frpc-tunnels.pid"))
+)
+FRPC_LOG_FILE = Path(
+    os.environ.get("SIMPLE_FRPC_LOG_FILE", str(LOG_DIR / "simple-frpc-tunnels.log"))
+)
+REMOTE_PORT_RANGE_RAW = os.environ.get("SIMPLE_TUNNEL_REMOTE_PORT_RANGE", "30000-39999")
+ALLOW_NON_LOOPBACK = os.environ.get("SIMPLE_ALLOW_NON_LOOPBACK", "false").lower() == "true"
+REQUIRE_LISTENING_LOCAL_PORT = (
+    os.environ.get("SIMPLE_REQUIRE_LISTENING_LOCAL_PORT", "false").lower() == "true"
+)
+STOP_TUNNELS_ON_EXIT = os.environ.get("SIMPLE_STOP_TUNNELS_ON_EXIT", "true").lower() == "true"
+CORS_ALLOW_ORIGINS = [
+    item.strip()
+    for item in os.environ.get("SIMPLE_CORS_ALLOW_ORIGINS", "http://localhost:9999").split(",")
+    if item.strip()
+]
+
+
+class SimpleTunnel(Base):
+    """A user-owned FRP TCP tunnel."""
+
+    __tablename__ = "simple_tunnels"
+
+    id = Column(Integer, primary_key=True, index=True)
+    owner = Column(String(64), nullable=False, index=True)
+    name = Column(String(64), nullable=False)
+    protocol = Column(String(16), nullable=False, default="tcp")
+    local_host = Column(String(255), nullable=False, default="127.0.0.1")
+    local_port = Column(Integer, nullable=False)
+    remote_port = Column(Integer, nullable=False, unique=True, index=True)
+    status = Column(String(32), nullable=False, default="configured")
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
 
 class LoginRequest(BaseModel):
-    """Request body for user login."""
+    """Login payload for local PAM authentication."""
 
-    username: str
-    password: str
-
-
-class RegisterRequest(BaseModel):
-    """Request body for user registration."""
-
-    username: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9_]+$")
-    password: str = Field(min_length=6, max_length=128)
-    email: str
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=4096)
 
 
-class InternalSSHKeySyncRequest(BaseModel):
-    """One SSH public key row pushed from cluster manager."""
+class TunnelCreateRequest(BaseModel):
+    """Create one TCP tunnel to a local service."""
 
-    public_key: str = Field(min_length=1, max_length=8192)
-    remark: str = Field(default="", max_length=255)
-    fingerprint: str = Field(min_length=1, max_length=255)
+    name: str | None = Field(default=None, max_length=64)
+    local_host: str = Field(default="127.0.0.1", min_length=1, max_length=255)
+    local_port: int = Field(ge=1, le=65535)
+    remote_port: int | None = Field(default=None, ge=1, le=65535)
 
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if any(ord(char) < 32 for char in normalized):
+            raise ValueError("Tunnel name contains control characters.")
+        return normalized
 
-class InternalUserSyncRequest(BaseModel):
-    """Request body for Clustermanager -> node user sync."""
-
-    username: str = Field(min_length=3, max_length=64, pattern=r"^[A-Za-z0-9_]+$")
-    email: str = Field(min_length=3, max_length=255)
-    password_hash: str | None = Field(default=None, max_length=255)
-    is_admin: bool = False
-    quota_gpu: int | None = Field(default=None, ge=1)
-    quota_memory_gb: int | None = Field(default=None, ge=8)
-    quota_max_instances: int | None = Field(default=None, ge=1)
-    ssh_public_keys: list[InternalSSHKeySyncRequest] = Field(default_factory=list)
-
-
-class InstanceCreateRequest(BaseModel):
-    """Request body for creating a new instance."""
-
-    num_gpus: int = Field(ge=0)
-    memory_gb: int = Field(ge=8)
-    image: str
-    auto_stop_hours: int | None = Field(
-        default=None, ge=MIN_AUTO_STOP_HOURS, le=MAX_AUTO_STOP_HOURS
-    )
-    expire_hours: int | None = Field(
-        default=None, ge=MIN_AUTO_STOP_HOURS, le=MAX_AUTO_STOP_HOURS
-    )
-    display_name: str | None = Field(default=None, max_length=128)
+    @field_validator("local_host")
+    @classmethod
+    def normalize_local_host(cls, value: str) -> str:
+        return value.strip()
 
 
-class InstanceRestartRequest(BaseModel):
-    """Request body for restarting an instance with a fresh auto-stop timer."""
-
-    auto_stop_hours: int | None = Field(
-        default=None, ge=MIN_AUTO_STOP_HOURS, le=MAX_AUTO_STOP_HOURS
-    )
-    expire_hours: int | None = Field(
-        default=None, ge=MIN_AUTO_STOP_HOURS, le=MAX_AUTO_STOP_HOURS
-    )
-
-
-class InstanceRenewRequest(BaseModel):
-    """Request body for resetting an instance auto-stop timer."""
-
-    reset_hours: int | None = Field(
-        default=None, ge=MIN_AUTO_STOP_HOURS, le=MAX_AUTO_STOP_HOURS
-    )
-    auto_stop_hours: int | None = Field(
-        default=None, ge=MIN_AUTO_STOP_HOURS, le=MAX_AUTO_STOP_HOURS
-    )
-    extend_hours: int | None = Field(
-        default=None, ge=MIN_AUTO_STOP_HOURS, le=MAX_AUTO_STOP_HOURS
-    )
-    extend_days: int | None = Field(default=None, ge=1, le=3)
+def _parse_port_range(raw: str) -> tuple[int, int]:
+    parts = raw.split("-", maxsplit=1)
+    if len(parts) != 2:
+        return (30000, 39999)
+    try:
+        start, end = int(parts[0]), int(parts[1])
+    except ValueError:
+        return (30000, 39999)
+    if start < 1 or end > 65535 or start > end:
+        return (30000, 39999)
+    return (start, end)
 
 
-class QuotaUpdateRequest(BaseModel):
-    """Request body for quota updates."""
-
-    quota_gpu: int = Field(ge=1)
-    quota_memory_gb: int = Field(ge=8)
-    quota_max_instances: int = Field(ge=1)
+REMOTE_PORT_RANGE = _parse_port_range(REMOTE_PORT_RANGE_RAW)
 
 
-class InstanceRebuildRequest(BaseModel):
-    """Request body for rebuilding an instance with a new GPU count."""
-
-    num_gpus: int = Field(ge=0)
-    memory_gb: int = Field(ge=8)
+def init_db() -> None:
+    """Create the small standalone schema used by the simplified backend."""
+    Base.metadata.create_all(bind=engine)
 
 
-def _serialize_instance(instance: Instance) -> dict[str, Any]:
-    """Convert an instance ORM object into an API response payload.
-
-    cluster_manager 适配：返回字段包含
-    id, container_name, gpu_indices, memory_gb, image_name, status,
-    ssh_port, ssh_password, auto_stop_at（无倒计时时为 null）, created_at
-    """
-    instance_obj = cast(Any, instance)
-    expire_seconds = None
-    expire_at = instance_obj.expire_at
-    stopped_at = instance_obj.stopped_at
-    ssh_port = instance_obj.ssh_port
-    auto_stop_hours = _default_auto_stop_hours(instance)
-    if expire_at is not None:
-        expire_seconds = int((expire_at - datetime.utcnow()).total_seconds())
-    return {
-        "id": instance_obj.id,
-        "user_id": instance_obj.user_id,
-        "username": instance_obj.user.username
-        if instance_obj.user is not None
-        else None,
-        "container_name": instance_obj.container_name,
-        "display_name": instance_obj.display_name,
-        "container_id": instance_obj.container_id,
-        "gpu_indices": instance_obj.gpu_indices,
-        "memory_gb": instance_obj.memory_gb,
-        "cpu_cores": instance_obj.cpu_cores,
-        "ssh_port": ssh_port,
-        "ssh_password": instance_obj.ssh_password,
-        "ssh_command": f"ssh -p {ssh_port} root@{SERVER_IP}"
-        if ssh_port is not None
-        else None,
-        "vps_access": instance_obj.vps_access,
-        "image_name": instance_obj.image_name,
-        "base_image_name": instance_obj.base_image_name or instance_obj.image_name,
-        "runtime_image_name": instance_obj.runtime_image_name or instance_obj.image_name,
-        "last_snapshot_image_name": instance_obj.last_snapshot_image_name,
-        "last_snapshot_at": instance_obj.last_snapshot_at.isoformat()
-        if instance_obj.last_snapshot_at is not None
-        else None,
-        "snapshot_status": instance_obj.snapshot_status or "none",
-        "status": instance_obj.status,
-        "last_exit_code": instance_obj.last_exit_code,
-        "last_error": instance_obj.last_error,
-        "created_at": instance_obj.created_at.isoformat(),
-        "stopped_at": stopped_at.isoformat() if stopped_at is not None else None,
-        "auto_stop_hours": auto_stop_hours,
-        "auto_stop_at": expire_at.isoformat() if expire_at is not None else None,
-        "auto_stop_seconds": expire_seconds,
-        "expire_at": expire_at.isoformat() if expire_at is not None else None,
-        "expire_seconds": expire_seconds,
-    }
+def get_db() -> Any:
+    """Provide a database session for FastAPI endpoints."""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
-def _get_running_usage(user: User) -> dict[str, int]:
-    """Compute current quota usage from running instances only."""
-    user_obj = cast(Any, user)
-    running_instances = [
-        instance
-        for instance in user_obj.instances
-        if cast(Any, instance).status == "running"
-    ]
-    return {
-        "used_gpu": sum(
-            len(cast(Any, instance).gpu_indices) for instance in running_instances
-        ),
-        "used_memory_gb": sum(
-            cast(Any, instance).memory_gb for instance in running_instances
-        ),
-        "used_instances": len(running_instances),
-    }
+def _require_internal_principal(
+    x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
+    x_user: str | None = Header(default=None, alias="X-User"),
+    x_user_is_admin: str = Header(default="false", alias="X-User-Is-Admin"),
+) -> Principal:
+    verify_internal_token(x_internal_token, INTERNAL_SERVICE_TOKEN)
+    username = str(x_user or "").strip()
+    if not username or not is_local_user_allowed(username):
+        raise HTTPException(status_code=403, detail="User is not a local account on this node.")
+    is_admin = x_user_is_admin.lower() in {"1", "true", "yes", "on"} or is_admin_username(username)
+    return Principal(username=username, is_admin=is_admin)
 
 
-def _get_node_running_memory_gb(db: Session) -> int:
-    """Compute total memory usage of all running instances on this node."""
-    running_instances = db.query(Instance).filter(Instance.status == "running").all()
-    total = 0
-    for instance in running_instances:
-        total += int(cast(Any, instance).memory_gb)
-    return total
-
-
-def _get_user_authorized_keys(db: Session, user_id: int) -> list[str]:
-    """Return all synced SSH public keys for one user."""
-    keys = (
-        db.query(UserSSHKey)
-        .filter(UserSSHKey.user_id == user_id)
-        .order_by(UserSSHKey.created_at.asc(), UserSSHKey.id.asc())
-        .all()
-    )
-    return [str(key.public_key) for key in keys if str(key.public_key).strip()]
-
-
-def _get_instance_for_user(db: Session, instance_id: int, user: User) -> Instance:
-    """Return an instance if it belongs to the user, otherwise raise 404."""
-    instance = (
-        db.query(Instance)
-        .options(joinedload(Instance.user))
-        .filter(Instance.id == instance_id, Instance.user_id == user.id)
-        .first()
-    )
-    if not instance:
-        raise HTTPException(status_code=404, detail="Instance not found.")
-    return instance
-
-
-def _runtime_image_for_instance(instance: Instance) -> str:
-    """Return the effective image used to boot the current instance container."""
-    instance_obj = cast(Any, instance)
-    return str(instance_obj.runtime_image_name or instance_obj.image_name)
-
-
-def _instance_is_running(instance: Instance) -> bool:
-    """Return whether the instance is currently marked as running."""
-    return str(cast(Any, instance).status) == "running"
-
-
-def _ensure_instance_not_rebuilding(instance: Instance) -> None:
-    """Reject lifecycle actions while one instance is in the rebuild critical section."""
-    if str(cast(Any, instance).status) != "rebuilding":
+def _ensure_local_host_allowed(local_host: str) -> None:
+    if ALLOW_NON_LOOPBACK:
         return
+    normalized = local_host.lower()
+    if normalized == "localhost":
+        return
+    try:
+        if ipaddress.ip_address(normalized).is_loopback:
+            return
+    except ValueError:
+        pass
     raise HTTPException(
-        status_code=409,
-        detail="Instance rebuild is already in progress.",
+        status_code=400,
+        detail="Only loopback local hosts are allowed by default. Set SIMPLE_ALLOW_NON_LOOPBACK=true to change this.",
     )
 
 
-def _add_gpu_allocations(db: Session, instance_id: int, gpu_indices: list[int]) -> None:
-    """Insert GPU allocation rows for one instance."""
-    for gpu_index in gpu_indices:
-        db.add(GPUAllocation(gpu_index=gpu_index, instance_id=instance_id))
+def _is_port_listening(host: str, port: int) -> bool:
+    import socket
 
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.8)
+        return sock.connect_ex((host, port)) == 0
 
-def _get_instance_allocated_gpu_indices(db: Session, instance: Instance) -> set[int]:
-    """Return GPU indices currently allocated to this instance."""
-    instance_obj = cast(Any, instance)
-    return {
-        int(allocation.gpu_index)
-        for allocation in db.query(GPUAllocation)
-        .filter(GPUAllocation.instance_id == instance_obj.id)
-        .all()
-    }
 
+def _validate_tunnel_request(payload: TunnelCreateRequest) -> None:
+    _ensure_local_host_allowed(payload.local_host)
+    if REQUIRE_LISTENING_LOCAL_PORT and not _is_port_listening(payload.local_host, payload.local_port):
+        raise HTTPException(status_code=400, detail="The local port is not listening.")
 
-def _cleanup_snapshot_image_if_unused(
-    db: Session,
-    image_ref: str | None,
-    *,
-    exclude_instance_id: int | None = None,
-) -> None:
-    """Delete one managed snapshot image when no instance metadata references it."""
-    if not container_manager.is_snapshot_image(image_ref):
-        return
-    query = db.query(Instance).filter(
-        or_(
-            Instance.runtime_image_name == image_ref,
-            Instance.last_snapshot_image_name == image_ref,
-        )
-    )
-    if exclude_instance_id is not None:
-        query = query.filter(Instance.id != exclude_instance_id)
-    if query.first() is not None:
-        return
-    try:
-        container_manager.remove_image(str(image_ref))
-    except RuntimeError as exc:
-        LOGGER.warning("Failed to cleanup unused snapshot image %s: %s", image_ref, exc)
 
-
-def _delete_instance(db: Session, instance: Instance) -> None:
-    """Delete a container instance and clean related allocations."""
-    instance_obj = cast(Any, instance)
-    snapshot_images_to_cleanup = {
-        image_ref
-        for image_ref in [
-            str(instance_obj.runtime_image_name or ""),
-            str(instance_obj.last_snapshot_image_name or ""),
-        ]
-        if container_manager.is_snapshot_image(image_ref)
-    }
-    cleanup_workspace = container_manager.locate_instance_workspace_cleanup_dir(
-        str(instance_obj.user.username), str(instance_obj.container_name)
-    )
-    try:
-        container_manager.remove_container(str(instance_obj.container_name))
-    except RuntimeError as exc:
-        if "not found" not in str(exc).lower():
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    if cleanup_workspace is not None:
-        try:
-            container_manager.remove_workspace(cleanup_workspace)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    gpu_manager.release(str(instance_obj.container_name), db)
-    LOGGER.info(
-        "Deleting instance %s for user %s",
-        instance_obj.container_name,
-        instance_obj.user.username,
-    )
-    db.delete(instance)
-    db.commit()
-    for image_ref in snapshot_images_to_cleanup:
-        _cleanup_snapshot_image_if_unused(db, image_ref)
-
-
-def _schedule_backup_cleanup(backup_path: Path) -> None:
-    """Delete a temporary backup directory after a short grace period."""
-
-    async def _cleanup() -> None:
-        await asyncio.sleep(300)
-        try:
-            container_manager.remove_workspace(backup_path)
-            LOGGER.info("Removed temporary backup %s", backup_path)
-        except RuntimeError as exc:
-            LOGGER.warning("Failed to remove temporary backup %s: %s", backup_path, exc)
-
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(_cleanup())
-    except RuntimeError:
-        LOGGER.info(
-            "No running event loop for delayed cleanup; removing backup now: %s",
-            backup_path,
-        )
-        try:
-            container_manager.remove_workspace(backup_path)
-        except RuntimeError as exc:
-            LOGGER.warning("Failed to remove temporary backup %s: %s", backup_path, exc)
-
-
-def _cleanup_instance_storage_dirs(*paths: Path | None) -> None:
-    """Best-effort cleanup for host-side instance directories."""
-    for path in paths:
-        if path is None:
-            continue
-        try:
-            container_manager.remove_workspace(path)
-        except RuntimeError:
-            continue
-
-
-def _restore_instance_container(
-    db: Session,
-    instance: Instance,
-    user: User,
-    *,
-    image_name: str,
-    gpu_indices: list[int],
-    memory_gb: int,
-    cpu_cores: int,
-    workspace_dir: Path,
-    running: bool,
-    stopped_at: datetime | None,
-) -> None:
-    """Create one container for the supplied instance config and apply target status."""
-    instance_obj = cast(Any, instance)
-    user_obj = cast(Any, user)
-    container_info = container_manager.create_container(
-        username=str(user_obj.username),
-        gpu_indices=gpu_indices,
-        memory_gb=memory_gb,
-        cpu_cores=cpu_cores,
-        image_name=image_name,
-        container_name=str(instance_obj.container_name),
-        workspace_dir=workspace_dir,
-        authorized_keys=_get_user_authorized_keys(db, int(user_obj.id)),
-    )
-    instance_obj.container_id = str(container_info["container_id"])
-    instance_obj.ssh_port = int(container_info["ssh_port"])
-    instance_obj.ssh_password = str(container_info["ssh_password"])
-    instance_obj.gpu_indices = list(gpu_indices)
-    instance_obj.memory_gb = memory_gb
-    instance_obj.cpu_cores = cpu_cores
-    if running:
-        _add_gpu_allocations(db, int(instance_obj.id), gpu_indices)
-        instance_obj.status = "running"
-        instance_obj.stopped_at = None
-        _clear_instance_runtime_error(instance)
-        return
-
-    container_manager.stop_container(str(instance_obj.container_name))
-    gpu_manager.release(str(instance_obj.container_name), db)
-    instance_obj.status = "stopped"
-    instance_obj.stopped_at = stopped_at or datetime.utcnow()
-    _clear_instance_auto_stop(instance)
-    _clear_instance_runtime_error(instance)
-
-
-def _rebuild_instance_in_place(
-    instance: Instance,
-    *,
-    new_memory_gb: int,
-) -> Instance:
-    """Apply a memory-only config change without recreating the container."""
-    instance_obj = cast(Any, instance)
-    container_manager.update_container_resources(
-        str(instance_obj.container_name),
-        memory_gb=new_memory_gb,
-    )
-    instance_obj.memory_gb = new_memory_gb
-    return instance
-
-
-def _rebuild_instance_with_new_gpus(
-    db: Session,
-    instance: Instance,
-    user: User,
-    new_gpu_indices: list[int],
-    new_memory_gb: int,
-    *,
-    original_status_override: str | None = None,
-    original_stopped_at_override: datetime | None = None,
-) -> Instance:
-    """Rebuild an instance after a GPU config change using one fresh environment snapshot."""
-    instance_obj = cast(Any, instance)
-    user_obj = cast(Any, user)
-    container_name = str(instance_obj.container_name)
-    original_status = str(original_status_override or instance_obj.status)
-    original_stopped_at = (
-        original_stopped_at_override
-        if original_stopped_at_override is not None
-        else instance_obj.stopped_at
-    )
-    original_runtime_image = _runtime_image_for_instance(instance)
-    original_snapshot_image = (
-        str(instance_obj.last_snapshot_image_name)
-        if instance_obj.last_snapshot_image_name
-        else None
-    )
-    original_snapshot_at = instance_obj.last_snapshot_at
-    original_gpu_indices = list(instance_obj.gpu_indices)
-    original_memory_gb = int(instance_obj.memory_gb)
-    original_cpu_cores = int(instance_obj.cpu_cores)
-    original_running = original_status == "running"
-    new_runtime_image: str | None = None
-    source_workspace = container_manager.locate_instance_workspace_dir(
-        str(user_obj.username), container_name
-    )
-    backup_path = source_workspace.parent / _unique_name(f"{user_obj.username}_backup")
-    target_workspace = container_manager.get_instance_workspace_dir(
-        str(user_obj.username), container_name, create=False
-    )
-
-    container_manager.create_workspace_backup(source_workspace, backup_path)
-
-    try:
-        if original_running:
-            container_manager.stop_container(container_name)
-        instance_obj.snapshot_status = "creating"
-        new_runtime_image = container_manager.snapshot_container(container_name)
-        instance_obj.last_snapshot_image_name = new_runtime_image
-        instance_obj.last_snapshot_at = datetime.utcnow()
-        instance_obj.snapshot_status = "ready"
-        instance_obj.runtime_image_name = new_runtime_image
-        db.flush()
-    except Exception as exc:
-        instance_obj.snapshot_status = "failed"
-        instance_obj.runtime_image_name = original_runtime_image
-        instance_obj.last_snapshot_image_name = original_snapshot_image
-        instance_obj.last_snapshot_at = original_snapshot_at
-        if original_running:
-            try:
-                container_manager.restart_container(container_name)
-            except RuntimeError as restart_exc:
-                _set_instance_runtime_error(
-                    instance,
-                    (
-                        "Failed to restart original container after snapshot failure: "
-                        f"{restart_exc}"
-                    ),
-                )
-                LOGGER.exception(
-                    "Failed to restore running state after snapshot failure for %s",
-                    container_name,
-                )
-                raise RuntimeError(
-                    f"Failed to snapshot instance {container_name} and restart the original container."
-                ) from restart_exc
-        instance_obj.status = original_status
-        instance_obj.stopped_at = original_stopped_at
-        LOGGER.exception("Failed to snapshot instance %s: %s", container_name, exc)
-        raise RuntimeError(
-            f"Failed to snapshot instance {container_name}; original container was kept."
-        ) from exc
-
-    try:
-        container_manager.remove_container(container_name)
-    except RuntimeError as exc:
-        instance_obj.runtime_image_name = original_runtime_image
-        if original_running:
-            try:
-                container_manager.restart_container(container_name)
-            except RuntimeError:
-                _set_instance_runtime_error(
-                    instance,
-                    "Failed to restore original container after removing it during rebuild.",
-                )
-        instance_obj.status = original_status
-        instance_obj.stopped_at = original_stopped_at
-        raise RuntimeError(
-            f"Failed to remove original container {container_name}: {exc}"
-        ) from exc
-
-    gpu_manager.release(container_name, db)
-
-    try:
-        container_manager.remove_workspace(target_workspace)
-        container_manager.copy_workspace(backup_path, target_workspace)
-        _restore_instance_container(
-            db,
-            instance,
-            user,
-            image_name=str(new_runtime_image),
-            gpu_indices=list(new_gpu_indices),
-            memory_gb=new_memory_gb,
-            cpu_cores=max(4, len(new_gpu_indices) * 8),
-            workspace_dir=target_workspace,
-            running=False,
-            stopped_at=datetime.utcnow(),
-        )
-        _schedule_backup_cleanup(backup_path)
-        for image_ref in {original_runtime_image, original_snapshot_image}:
-            if image_ref and image_ref != new_runtime_image:
-                _cleanup_snapshot_image_if_unused(
-                    db,
-                    image_ref,
-                    exclude_instance_id=int(instance_obj.id),
-                )
-        return instance
-    except Exception as exc:
-        try:
-            container_manager.remove_container(container_name)
-        except RuntimeError:
-            pass
-        container_manager.restore_workspace_backup(backup_path, target_workspace)
-        try:
-            _restore_instance_container(
-                db,
-                instance,
-                user,
-                image_name=str(new_runtime_image),
-                gpu_indices=original_gpu_indices,
-                memory_gb=original_memory_gb,
-                cpu_cores=original_cpu_cores,
-                workspace_dir=target_workspace,
-                running=original_running,
-                stopped_at=original_stopped_at,
-            )
-            _schedule_backup_cleanup(backup_path)
-        except Exception as rollback_exc:
-            instance_obj.gpu_indices = original_gpu_indices
-            instance_obj.memory_gb = original_memory_gb
-            instance_obj.cpu_cores = original_cpu_cores
-            _set_instance_runtime_error(
-                instance,
-                f"Failed to rollback instance after rebuild error: {rollback_exc}",
-            )
-            instance_obj.stopped_at = datetime.utcnow()
-            LOGGER.exception(
-                "Failed to rollback instance %s after rebuild error: %s",
-                container_name,
-                rollback_exc,
-            )
-            raise RuntimeError(
-                f"Failed to rebuild instance {container_name}; automatic rollback also failed."
-            ) from rollback_exc
-
-        LOGGER.exception("Failed to rebuild instance %s: %s", container_name, exc)
-        raise RuntimeError(
-            f"Failed to rebuild instance {container_name}; the original config was restored from the latest snapshot."
-        ) from exc
-
-
-def _repair_instance_with_base_image(
-    db: Session,
-    instance: Instance,
-    user: User,
-    target_gpu_indices: list[int],
-    *,
-    original_status_override: str | None = None,
-    original_stopped_at_override: datetime | None = None,
-) -> Instance:
-    """Recreate one broken/stopped instance from its base image while keeping workspace."""
-    instance_obj = cast(Any, instance)
-    user_obj = cast(Any, user)
-    container_name = str(instance_obj.container_name)
-    original_status = str(original_status_override or instance_obj.status)
-    original_stopped_at = (
-        original_stopped_at_override
-        if original_stopped_at_override is not None
-        else instance_obj.stopped_at
-    )
-    original_runtime_image = _runtime_image_for_instance(instance)
-    original_snapshot_image = (
-        str(instance_obj.last_snapshot_image_name)
-        if instance_obj.last_snapshot_image_name
-        else None
-    )
-    original_snapshot_at = instance_obj.last_snapshot_at
-    original_gpu_indices = list(instance_obj.gpu_indices)
-    original_memory_gb = int(instance_obj.memory_gb)
-    workspace_dir = container_manager.locate_instance_workspace_dir(
-        str(user_obj.username), container_name
-    )
-
-    try:
-        repair_image = container_manager.ensure_image_available(
-            str(
-                instance_obj.base_image_name
-                or instance_obj.image_name
-                or instance_obj.runtime_image_name
-            )
-        )
-    except RuntimeError as exc:
-        raise RuntimeError(
-            f"Base image for repairing instance {container_name} is unavailable: {exc}"
-        ) from exc
-
-    try:
-        container_manager.remove_container(container_name)
-    except RuntimeError as exc:
-        if "not found" not in str(exc).lower():
-            raise RuntimeError(
-                f"Failed to remove broken container {container_name}: {exc}"
-            ) from exc
-
-    gpu_manager.release(container_name, db)
-
-    target_cpu_cores = max(4, len(target_gpu_indices) * 8)
-    if target_gpu_indices:
-        gpu_manager.allocate(
-            user,
-            target_gpu_indices,
-            original_memory_gb,
-            target_cpu_cores,
-            db,
-        )
-
-    try:
-        _restore_instance_container(
-            db,
-            instance,
-            user,
-            image_name=repair_image,
-            gpu_indices=list(target_gpu_indices),
-            memory_gb=original_memory_gb,
-            cpu_cores=target_cpu_cores,
-            workspace_dir=workspace_dir,
-            running=True,
-            stopped_at=None,
-        )
-        instance_obj.image_name = repair_image
-        instance_obj.base_image_name = repair_image
-        instance_obj.runtime_image_name = repair_image
-        instance_obj.last_snapshot_image_name = None
-        instance_obj.last_snapshot_at = None
-        instance_obj.snapshot_status = "none"
-        for image_ref in {original_runtime_image, original_snapshot_image}:
-            _cleanup_snapshot_image_if_unused(
-                db,
-                image_ref,
-                exclude_instance_id=int(instance_obj.id),
-            )
-        return instance
-    except Exception as exc:
-        try:
-            container_manager.remove_container(container_name)
-        except RuntimeError:
-            pass
-        gpu_manager.release(container_name, db)
-        instance_obj.gpu_indices = original_gpu_indices
-        instance_obj.memory_gb = original_memory_gb
-        instance_obj.runtime_image_name = original_runtime_image
-        instance_obj.last_snapshot_image_name = original_snapshot_image
-        instance_obj.last_snapshot_at = original_snapshot_at
-        instance_obj.snapshot_status = "ready" if original_snapshot_image else "none"
-        instance_obj.stopped_at = original_stopped_at or datetime.utcnow()
-        _set_instance_runtime_error(
-            instance,
-            (
-                "Failed to repair instance from base image; only workspace would be kept. "
-                f"Original error: {exc}"
-            ),
-            status=original_status if original_status in {"error", "start_failed"} else "error",
-        )
-        raise RuntimeError(
-            f"Failed to repair instance {container_name} from base image: {exc}"
-        ) from exc
-
-
-def _remount_instance_workspace(
-    db: Session,
-    instance: Instance,
-    user: User,
-    *,
-    original_status_override: str | None = None,
-    original_stopped_at_override: datetime | None = None,
-) -> Instance:
-    """Recreate one stopped container so Docker refreshes its workspace bind source."""
-    instance_obj = cast(Any, instance)
-    user_obj = cast(Any, user)
-    container_name = str(instance_obj.container_name)
-    original_status = str(original_status_override or instance_obj.status)
-    original_stopped_at = (
-        original_stopped_at_override
-        if original_stopped_at_override is not None
-        else instance_obj.stopped_at
-    )
-    mount_info = container_manager.inspect_workspace_mount(
-        str(user_obj.username), container_name
-    )
-    if mount_info.get("source_matches_expected") is True:
-        instance_obj.status = original_status
-        instance_obj.stopped_at = original_stopped_at
-        return instance
-    if mount_info.get("error"):
-        raise RuntimeError(str(mount_info["error"]))
-
-    original_runtime_image = _runtime_image_for_instance(instance)
-    original_snapshot_image = (
-        str(instance_obj.last_snapshot_image_name)
-        if instance_obj.last_snapshot_image_name
-        else None
-    )
-    original_snapshot_at = instance_obj.last_snapshot_at
-    original_gpu_indices = list(instance_obj.gpu_indices)
-    original_memory_gb = int(instance_obj.memory_gb)
-    original_cpu_cores = int(instance_obj.cpu_cores)
-    original_workspace = (
-        Path(str(mount_info["actual_source"]))
-        if mount_info.get("actual_source")
-        else container_manager.locate_instance_workspace_dir(
-            str(user_obj.username), container_name
-        )
-    )
-    target_workspace = container_manager.get_instance_workspace_dir(
-        str(user_obj.username), container_name
-    )
-    new_runtime_image: str | None = None
-
-    if not container_manager.paths_same_location(original_workspace, target_workspace):
-        if container_manager.path_contains(original_workspace, target_workspace):
-            raise RuntimeError(
-                "This instance appears to use a legacy shared workspace. "
-                f"Move the required data from {original_workspace} to "
-                f"{target_workspace} manually before remounting."
-            )
-        if not container_manager.workspace_has_entries(target_workspace):
-            if not original_workspace.exists():
-                raise RuntimeError(
-                    "Current workspace target is empty, but the old workspace source "
-                    f"{original_workspace} is not readable. Migrate workspace data to "
-                    f"{target_workspace} before remounting."
-                )
-            container_manager.copy_workspace(original_workspace, target_workspace)
-
-    try:
-        instance_obj.snapshot_status = "creating"
-        db.flush()
-        new_runtime_image = container_manager.snapshot_container(container_name)
-        instance_obj.last_snapshot_image_name = new_runtime_image
-        instance_obj.last_snapshot_at = datetime.utcnow()
-        instance_obj.snapshot_status = "ready"
-        instance_obj.runtime_image_name = new_runtime_image
-        db.flush()
-    except Exception as exc:
-        instance_obj.snapshot_status = "failed"
-        instance_obj.runtime_image_name = original_runtime_image
-        instance_obj.last_snapshot_image_name = original_snapshot_image
-        instance_obj.last_snapshot_at = original_snapshot_at
-        raise RuntimeError(
-            f"Failed to snapshot instance {container_name}; original container was kept."
-        ) from exc
-
-    try:
-        container_manager.remove_container(container_name)
-    except RuntimeError as exc:
-        instance_obj.runtime_image_name = original_runtime_image
-        instance_obj.last_snapshot_image_name = original_snapshot_image
-        instance_obj.last_snapshot_at = original_snapshot_at
-        instance_obj.snapshot_status = "ready" if original_snapshot_image else "none"
-        try:
-            container_manager.remove_image(str(new_runtime_image))
-        except RuntimeError as cleanup_exc:
-            LOGGER.warning(
-                "Failed to remove unused remount snapshot %s: %s",
-                new_runtime_image,
-                cleanup_exc,
-            )
-        raise RuntimeError(
-            f"Failed to remove original container {container_name}: {exc}"
-        ) from exc
-
-    gpu_manager.release(container_name, db)
-
-    try:
-        _restore_instance_container(
-            db,
-            instance,
-            user,
-            image_name=str(new_runtime_image),
-            gpu_indices=original_gpu_indices,
-            memory_gb=original_memory_gb,
-            cpu_cores=original_cpu_cores,
-            workspace_dir=target_workspace,
-            running=False,
-            stopped_at=original_stopped_at or datetime.utcnow(),
-        )
-        for image_ref in {original_runtime_image, original_snapshot_image}:
-            if image_ref and image_ref != new_runtime_image:
-                _cleanup_snapshot_image_if_unused(
-                    db,
-                    image_ref,
-                    exclude_instance_id=int(instance_obj.id),
-                )
-        return instance
-    except Exception as exc:
-        try:
-            container_manager.remove_container(container_name)
-        except RuntimeError:
-            pass
-        try:
-            _restore_instance_container(
-                db,
-                instance,
-                user,
-                image_name=str(new_runtime_image),
-                gpu_indices=original_gpu_indices,
-                memory_gb=original_memory_gb,
-                cpu_cores=original_cpu_cores,
-                workspace_dir=original_workspace,
-                running=False,
-                stopped_at=original_stopped_at or datetime.utcnow(),
-            )
-            instance_obj.status = original_status
-            instance_obj.stopped_at = original_stopped_at
-        except Exception as rollback_exc:
-            instance_obj.gpu_indices = original_gpu_indices
-            instance_obj.memory_gb = original_memory_gb
-            instance_obj.cpu_cores = original_cpu_cores
-            instance_obj.runtime_image_name = new_runtime_image
-            instance_obj.last_snapshot_image_name = new_runtime_image
-            instance_obj.snapshot_status = "failed"
-            _set_instance_runtime_error(
-                instance,
-                f"Failed to rollback workspace remount: {rollback_exc}",
-            )
-            instance_obj.stopped_at = datetime.utcnow()
-            LOGGER.exception(
-                "Failed to rollback workspace remount for %s: %s",
-                container_name,
-                rollback_exc,
-            )
-            raise RuntimeError(
-                f"Failed to remount workspace for {container_name}; automatic rollback also failed."
-            ) from rollback_exc
-        raise RuntimeError(
-            f"Failed to remount workspace for {container_name}; original mount was restored."
-        ) from exc
-
-
-def _run_remount_instance_workspace_job(
-    instance_id: int,
-    original_status: str,
-    original_stopped_at: datetime | None,
-) -> None:
-    """Run a workspace remount after the admin API has returned."""
-    db = SessionLocal()
-    try:
-        instance = (
-            db.query(Instance)
-            .options(joinedload(Instance.user))
-            .filter(Instance.id == instance_id)
-            .first()
-        )
-        if instance is None:
-            LOGGER.warning("Workspace remount job skipped; instance %s is missing", instance_id)
-            return
-
-        instance_obj = cast(Any, instance)
-        with gpu_manager.locked_allocation():
-            try:
-                remounted_instance = _remount_instance_workspace(
-                    db,
-                    instance,
-                    cast(User, instance_obj.user),
-                    original_status_override=original_status,
-                    original_stopped_at_override=original_stopped_at,
-                )
-                LOGGER.info(
-                    "Remounted workspace for instance %s by admin background job",
-                    cast(Any, remounted_instance).container_name,
-                )
-                db.commit()
-            except Exception as exc:
-                if str(instance_obj.status) == "rebuilding":
-                    instance_obj.status = original_status
-                    instance_obj.stopped_at = original_stopped_at
-                _set_instance_runtime_error(
-                    instance,
-                    f"Workspace remount failed: {exc}",
-                    status=original_status
-                    if original_status in {"stopped", "error", "start_failed"}
-                    else "error",
-                )
-                db.commit()
-                LOGGER.exception(
-                    "Workspace remount background job failed for instance %s: %s",
-                    instance_obj.container_name,
-                    exc,
-                )
-    finally:
-        remount_jobs_in_progress.discard(instance_id)
-        db.close()
-
-
-def _restore_instance_after_background_error(
-    instance: Instance,
-    *,
-    original_status: str,
-    original_stopped_at: datetime | None,
-    detail: str,
-) -> None:
-    """Leave an instance actionable after a failed background lifecycle job."""
-    instance_obj = cast(Any, instance)
-    if str(instance_obj.status) == "rebuilding":
-        instance_obj.status = original_status
-        instance_obj.stopped_at = original_stopped_at
-    instance_obj.last_error = detail
-    instance_obj.last_exit_code = None
-
-
-def _run_rebuild_instance_job(
-    instance_id: int,
-    user_id: int,
-    *,
-    num_gpus: int,
-    memory_gb: int,
-    original_status: str,
-    original_stopped_at: datetime | None,
-    original_gpu_count: int,
-) -> None:
-    """Run an instance rebuild outside the request/response path."""
-    db = SessionLocal()
-    try:
-        instance = (
-            db.query(Instance)
-            .options(joinedload(Instance.user))
-            .filter(Instance.id == instance_id)
-            .first()
-        )
-        user = db.query(User).filter(User.id == user_id).first()
-        if instance is None or user is None:
-            LOGGER.warning(
-                "Rebuild job skipped; instance=%s user=%s is missing",
-                instance_id,
-                user_id,
-            )
-            return
-
-        instance_obj = cast(Any, instance)
-        user_obj = cast(Any, user)
-        with gpu_manager.locked_allocation():
-            try:
-                if num_gpus == original_gpu_count:
-                    rebuilt_instance = _rebuild_instance_in_place(
-                        instance,
-                        new_memory_gb=memory_gb,
-                    )
-                    instance_obj.status = original_status
-                    instance_obj.stopped_at = original_stopped_at
-                    LOGGER.info(
-                        "Updated instance %s in background for user %s with memory %sGB",
-                        instance_obj.container_name,
-                        user_obj.username,
-                        memory_gb,
-                    )
-                else:
-                    selected_gpus = _choose_rebuild_gpu_indices(db, instance, num_gpus)
-                    rebuilt_instance = _rebuild_instance_with_new_gpus(
-                        db,
-                        instance,
-                        user,
-                        selected_gpus,
-                        memory_gb,
-                        original_status_override=original_status,
-                        original_stopped_at_override=original_stopped_at,
-                    )
-                    LOGGER.info(
-                        "Rebuilt instance %s in background for user %s with GPUs %s and memory %sGB",
-                        instance_obj.container_name,
-                        user_obj.username,
-                        selected_gpus,
-                        memory_gb,
-                    )
-                _clear_instance_runtime_error(rebuilt_instance)
-                db.commit()
-            except Exception as exc:
-                _restore_instance_after_background_error(
-                    instance,
-                    original_status=original_status,
-                    original_stopped_at=original_stopped_at,
-                    detail=f"Background rebuild failed: {exc}",
-                )
-                db.commit()
-                LOGGER.exception(
-                    "Background rebuild failed for instance %s: %s",
-                    instance_obj.container_name,
-                    exc,
-                )
-    finally:
-        instance_jobs_in_progress.discard(instance_id)
-        db.close()
-
-
-def _run_repair_instance_job(
-    instance_id: int,
-    user_id: int,
-    *,
-    original_status: str,
-    original_stopped_at: datetime | None,
-) -> None:
-    """Run an instance repair outside the request/response path."""
-    db = SessionLocal()
-    try:
-        instance = (
-            db.query(Instance)
-            .options(joinedload(Instance.user))
-            .filter(Instance.id == instance_id)
-            .first()
-        )
-        user = db.query(User).filter(User.id == user_id).first()
-        if instance is None or user is None:
-            LOGGER.warning(
-                "Repair job skipped; instance=%s user=%s is missing",
-                instance_id,
-                user_id,
-            )
-            return
-
-        instance_obj = cast(Any, instance)
-        user_obj = cast(Any, user)
-        with gpu_manager.locked_allocation():
-            try:
-                target_gpu_indices = _choose_instance_gpu_indices(
-                    db,
-                    instance,
-                    len(list(instance_obj.gpu_indices)),
-                    insufficient_detail="Not enough available GPUs to repair this instance.",
-                )
-                repaired_instance = _repair_instance_with_base_image(
-                    db,
-                    instance,
-                    user,
-                    target_gpu_indices,
-                    original_status_override=original_status,
-                    original_stopped_at_override=original_stopped_at,
-                )
-                _clear_instance_runtime_error(repaired_instance)
-                LOGGER.info(
-                    "Repaired instance %s for user %s in background",
-                    instance_obj.container_name,
-                    user_obj.username,
-                )
-                db.commit()
-            except Exception as exc:
-                _restore_instance_after_background_error(
-                    instance,
-                    original_status=original_status,
-                    original_stopped_at=original_stopped_at,
-                    detail=f"Background repair failed: {exc}",
-                )
-                db.commit()
-                LOGGER.exception(
-                    "Background repair failed for instance %s: %s",
-                    instance_obj.container_name,
-                    exc,
-                )
-    finally:
-        instance_jobs_in_progress.discard(instance_id)
-        db.close()
-
-
-def _choose_instance_gpu_indices(
-    db: Session,
-    instance: Instance,
-    requested_gpu_count: int,
-    *,
-    insufficient_detail: str,
-) -> list[int]:
-    """Choose GPUs for an instance action, preferring reusable current GPUs."""
-    instance_obj = cast(Any, instance)
-    current_gpu_indices = [
-        int(gpu_index) for gpu_index in list(instance_obj.gpu_indices)
-    ]
-    if requested_gpu_count == 0:
-        return []
-
-    owned_allocated_gpus = _get_instance_allocated_gpu_indices(db, instance)
-    statuses = gpu_manager.get_gpu_status(db)
-    status_map: dict[int, dict[str, Any]] = {}
-    for status in statuses:
-        gpu_index = status.get("index")
-        if isinstance(gpu_index, int):
-            status_map[gpu_index] = status
-
-    reusable: list[int] = []
-    for gpu_index in current_gpu_indices:
-        if gpu_index not in status_map or gpu_index in reusable:
-            continue
-        status = status_map[gpu_index]
-        if gpu_index in owned_allocated_gpus or bool(status.get("is_idle")):
-            reusable.append(gpu_index)
-
-    selected = reusable[:requested_gpu_count]
-    if len(selected) == requested_gpu_count:
-        return selected
-
-    idle_candidates = [
-        gpu_index
-        for gpu_index, status in status_map.items()
-        if bool(status.get("is_idle")) and gpu_index not in selected
-    ]
-    needed = requested_gpu_count - len(selected)
-    if len(idle_candidates) < needed:
-        raise HTTPException(
-            status_code=400,
-            detail=insufficient_detail,
-        )
-    selected.extend(idle_candidates[:needed])
-    return selected
-
-
-def _choose_rebuild_gpu_indices(
-    db: Session,
-    instance: Instance,
-    requested_gpu_count: int,
-) -> list[int]:
-    """Choose GPUs for an instance rebuild, preferring current assignments."""
-    return _choose_instance_gpu_indices(
-        db,
-        instance,
-        requested_gpu_count,
-        insufficient_detail="Not enough available GPUs to rebuild this instance.",
-    )
-
-
-def _restart_instance_with_reassigned_gpus(
-    db: Session,
-    instance: Instance,
-    user: User,
-    new_gpu_indices: list[int],
-) -> Instance:
-    """Restart a stopped instance by recreating its container on newly selected GPUs."""
-    instance_obj = cast(Any, instance)
-    user_obj = cast(Any, user)
-    container_name = str(instance_obj.container_name)
-    original_runtime_image = _runtime_image_for_instance(instance)
-    original_snapshot_image = (
-        str(instance_obj.last_snapshot_image_name)
-        if instance_obj.last_snapshot_image_name
-        else None
-    )
-    original_snapshot_at = instance_obj.last_snapshot_at
-    original_gpu_indices = list(instance_obj.gpu_indices)
-    original_memory_gb = int(instance_obj.memory_gb)
-    original_cpu_cores = int(instance_obj.cpu_cores)
-    workspace_dir = container_manager.locate_instance_workspace_dir(
-        str(user_obj.username), container_name
-    )
-    new_runtime_image: str | None = None
-
-    try:
-        instance_obj.snapshot_status = "creating"
-        db.flush()
-        new_runtime_image = container_manager.snapshot_container(container_name)
-        instance_obj.last_snapshot_image_name = new_runtime_image
-        instance_obj.last_snapshot_at = datetime.utcnow()
-        instance_obj.snapshot_status = "ready"
-        instance_obj.runtime_image_name = new_runtime_image
-        db.flush()
-    except Exception as exc:
-        instance_obj.snapshot_status = "failed"
-        instance_obj.runtime_image_name = original_runtime_image
-        instance_obj.last_snapshot_image_name = original_snapshot_image
-        instance_obj.last_snapshot_at = original_snapshot_at
-        raise RuntimeError(
-            f"Failed to snapshot instance {container_name}; original stopped container was kept."
-        ) from exc
-
-    try:
-        container_manager.remove_container(container_name)
-    except RuntimeError as exc:
-        instance_obj.runtime_image_name = original_runtime_image
-        instance_obj.last_snapshot_image_name = original_snapshot_image
-        instance_obj.last_snapshot_at = original_snapshot_at
-        instance_obj.snapshot_status = "ready" if original_snapshot_image else "none"
-        try:
-            container_manager.remove_image(str(new_runtime_image))
-        except RuntimeError as cleanup_exc:
-            LOGGER.warning(
-                "Failed to remove unused restart snapshot %s: %s",
-                new_runtime_image,
-                cleanup_exc,
-            )
-        raise RuntimeError(
-            f"Failed to remove original container {container_name}: {exc}"
-        ) from exc
-
-    gpu_manager.release(container_name, db)
-
-    try:
-        _restore_instance_container(
-            db,
-            instance,
-            user,
-            image_name=str(new_runtime_image),
-            gpu_indices=list(new_gpu_indices),
-            memory_gb=original_memory_gb,
-            cpu_cores=max(4, len(new_gpu_indices) * 8),
-            workspace_dir=workspace_dir,
-            running=True,
-            stopped_at=None,
-        )
-        for image_ref in {original_runtime_image, original_snapshot_image}:
-            if image_ref and image_ref != new_runtime_image:
-                _cleanup_snapshot_image_if_unused(
-                    db,
-                    image_ref,
-                    exclude_instance_id=int(instance_obj.id),
-                )
-        return instance
-    except Exception as exc:
-        try:
-            container_manager.remove_container(container_name)
-        except RuntimeError:
-            pass
-        try:
-            _restore_instance_container(
-                db,
-                instance,
-                user,
-                image_name=str(new_runtime_image),
-                gpu_indices=original_gpu_indices,
-                memory_gb=original_memory_gb,
-                cpu_cores=original_cpu_cores,
-                workspace_dir=workspace_dir,
-                running=False,
-                stopped_at=datetime.utcnow(),
-            )
-        except Exception as rollback_exc:
-            instance_obj.gpu_indices = original_gpu_indices
-            instance_obj.memory_gb = original_memory_gb
-            instance_obj.cpu_cores = original_cpu_cores
-            instance_obj.runtime_image_name = new_runtime_image
-            instance_obj.last_snapshot_image_name = new_runtime_image
-            instance_obj.snapshot_status = "failed"
-            _set_instance_runtime_error(
-                instance,
-                f"Failed to restore stopped instance after restart error: {rollback_exc}",
-            )
-            instance_obj.stopped_at = datetime.utcnow()
-            LOGGER.exception(
-                "Failed to restore stopped instance %s after restart error: %s",
-                container_name,
-                rollback_exc,
-            )
-            raise InstanceStateChangedError(
-                f"Failed to restart instance {container_name}; automatic fallback also failed."
-            ) from rollback_exc
-
-        LOGGER.exception(
-            "Failed to restart instance %s with reassigned GPUs: %s",
-            container_name,
-            exc,
-        )
-        raise InstanceStateChangedError(
-            f"Failed to restart instance {container_name}; it was kept stopped on the latest snapshot."
-        ) from exc
-
-
-@app.get("/")
-def index() -> dict[str, str]:
-    """Return a minimal service description instead of a node-local frontend."""
-    return {
-        "service": "Servermanager",
-        "role": "node-backend",
-        "message": "Node frontend has been removed. Use Clustermanager as the web console.",
-    }
-
-
-@app.get("/api/meta")
-def get_meta(db: Session = Depends(get_db)) -> dict[str, Any]:
-    """Return frontend bootstrap metadata."""
-    node_memory_used_gb = _get_node_running_memory_gb(db)
-    node_memory_free_gb = max(0, NODE_ALLOCATABLE_MEMORY_GB - node_memory_used_gb)
-    return {
-        "server_ip": SERVER_IP,
-        "allow_register": False,
-        "memory_options_gb": list(INSTANCE_MEMORY_OPTIONS_GB),
-        "max_instance_memory_gb": MAX_INSTANCE_MEMORY_GB,
-        "node_allocatable_memory_gb": NODE_ALLOCATABLE_MEMORY_GB,
-        "node_memory_used_gb": node_memory_used_gb,
-        "node_memory_free_gb": node_memory_free_gb,
-    }
-
-
-@app.get("/api/images")
-def get_images() -> dict[str, Any]:
-    """Return base image options for create UI.
-
-    key: 前端提交到创建接口的镜像键
-    label: 展示名称
-    image_ref: 节点实际 Docker 镜像引用
-    """
-    try:
-        local_images = container_manager.list_local_images()
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
-    images = [
-        {
-            "key": image["image_ref"],
-            "label": image["image_ref"],
-            "image_ref": image["image_ref"],
-        }
-        for image in local_images
-        if _is_selectable_base_image(image["image_ref"])
-    ]
-    return {"images": images}
-
-
-@app.post("/api/auth/login")
-def login(payload: LoginRequest, db: Session = Depends(get_db)) -> dict[str, Any]:
-    """Authenticate the node-local admin account for internal maintenance use only."""
-    if payload.username != ADMIN_USERNAME:
-        raise HTTPException(
-            status_code=403,
-            detail="Node-local user login has been removed. Use Clustermanager.",
-        )
-    user = (
-        db.query(User)
-        .options(joinedload(User.instances))
-        .filter(User.username == payload.username)
-        .first()
-    )
-    if user is None:
-        raise HTTPException(
-            status_code=401, detail="Incorrect administrator username or password."
-        )
-    user_obj = cast(Any, user)
-    if not bool(user_obj.is_admin):
-        raise HTTPException(
-            status_code=403,
-            detail="Node-local user login has been removed. Use Clustermanager.",
-        )
-    if not verify_password(payload.password, str(user_obj.password_hash)):
-        raise HTTPException(
-            status_code=401, detail="Incorrect administrator username or password."
-        )
-    usage = _get_running_usage(user)
-    return {
-        "access_token": create_access_token(
-            str(user_obj.username),
-            is_admin=bool(user_obj.is_admin),
-            email=str(user_obj.email),
-        ),
-        "token_type": "bearer",
-        "user": {
-            "id": user_obj.id,
-            "username": user_obj.username,
-            "email": user_obj.email,
-            "is_admin": user_obj.is_admin,
-            **usage,
-            "quota_gpu": user_obj.quota_gpu,
-            "quota_memory_gb": user_obj.quota_memory_gb,
-            "quota_max_instances": user_obj.quota_max_instances,
-        },
-    }
-
-
-@app.get("/api/me")
-def get_me(current_user: User = Depends(get_current_user)) -> dict[str, Any]:
-    """Return current authenticated user profile for token-based bootstrap."""
-    current_user_obj = cast(Any, current_user)
-    usage = _get_running_usage(current_user)
-    return {
-        "id": current_user_obj.id,
-        "username": current_user_obj.username,
-        "email": current_user_obj.email,
-        "is_admin": current_user_obj.is_admin,
-        **usage,
-        "quota_gpu": current_user_obj.quota_gpu,
-        "quota_memory_gb": current_user_obj.quota_memory_gb,
-        "quota_max_instances": current_user_obj.quota_max_instances,
-    }
-
-
-@app.post("/api/auth/register")
-def register(payload: RegisterRequest, db: Session = Depends(get_db)) -> dict[str, str]:
-    """Node-local registration is deprecated; users must register via Clustermanager."""
-    del payload
-    del db
-    raise HTTPException(
-        status_code=410,
-        detail="Node-local registration has been removed. Use Clustermanager.",
-    )
-
-
-@app.get("/api/instances")
-def list_instances(
-    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
-) -> list[dict[str, Any]]:
-    """List all instances owned by the current user."""
-    instances = (
-        db.query(Instance)
-        .options(joinedload(Instance.user))
-        .filter(Instance.user_id == current_user.id)
-        .order_by(Instance.created_at.desc())
-        .all()
-    )
-    return [_serialize_instance(instance) for instance in instances]
-
-
-@app.post("/api/instances")
-def create_instance(
-    payload: InstanceCreateRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    """Create a new GPU container instance for the current user."""
-    current_user_obj = cast(Any, current_user)
-    if payload.num_gpus not in {0, 1, 2, 4, 8}:
-        raise HTTPException(
-            status_code=400, detail="Supported GPU counts are 0, 1, 2, 4, or 8."
-        )
-    if payload.memory_gb % 8 != 0:
-        raise HTTPException(
-            status_code=400, detail="Memory must be allocated in 8 GB increments."
-        )
-    if payload.memory_gb > MAX_INSTANCE_MEMORY_GB:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Memory cannot exceed {MAX_INSTANCE_MEMORY_GB} GB.",
-        )
-    if payload.memory_gb not in INSTANCE_MEMORY_OPTIONS_GB:
-        allowed = ", ".join(str(value) for value in INSTANCE_MEMORY_OPTIONS_GB)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Memory must be one of configured options: {allowed} GB.",
-        )
-    _enforce_cpu_only_min_memory(payload.num_gpus, payload.memory_gb)
-    _enforce_gpu_memory_limit(payload.num_gpus, payload.memory_gb)
-    try:
-        resolved_image_ref = container_manager.ensure_image_available(payload.image)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if not _is_selectable_base_image(resolved_image_ref):
-        raise HTTPException(
-            status_code=400,
-            detail="Managed snapshot images cannot be selected as base images.",
-        )
-    normalized_display_name = _normalize_display_name(payload.display_name)
-
-    db.refresh(current_user)
-    usage = _get_running_usage(current_user)
-    if usage["used_instances"] + 1 > int(current_user_obj.quota_max_instances):
-        raise HTTPException(status_code=400, detail="Instance quota exceeded.")
-    if usage["used_gpu"] + payload.num_gpus > int(current_user_obj.quota_gpu):
-        raise HTTPException(status_code=400, detail="GPU quota exceeded.")
-    if usage["used_memory_gb"] + payload.memory_gb > int(
-        current_user_obj.quota_memory_gb
-    ):
-        raise HTTPException(status_code=400, detail="Memory quota exceeded.")
-
-    node_running_memory_gb = _get_node_running_memory_gb(db)
-    projected_node_memory_gb = node_running_memory_gb + payload.memory_gb
-    if (
-        projected_node_memory_gb > NODE_ALLOCATABLE_MEMORY_GB
-        and not _is_cpu_only_min_memory(payload.num_gpus, payload.memory_gb)
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Node allocatable memory exceeded. "
-                f"Used {node_running_memory_gb} GB, requested +{payload.memory_gb} GB, "
-                f"limit {NODE_ALLOCATABLE_MEMORY_GB} GB."
-            ),
-        )
-
-    cpu_cores = max(4, payload.num_gpus * 8)
-    auto_stop_hours = _resolve_auto_stop_hours(
-        payload.auto_stop_hours,
-        payload.expire_hours,
-        default=DEFAULT_AUTO_STOP_HOURS,
-    )
-    expire_at = _calculate_auto_stop_at(auto_stop_hours)
-    container_name = _unique_name(f"gpu_user_{current_user_obj.username}")
-    display_name = normalized_display_name or container_name
-    existing_instance = (
-        db.query(Instance)
-        .filter(
-            Instance.user_id == current_user.id,
-            Instance.display_name == display_name,
-        )
-        .first()
-    )
-    if existing_instance is not None:
-        raise HTTPException(status_code=400, detail="Instance name is already in use.")
-    workspace_path = container_manager.get_instance_workspace_dir(
-        str(current_user_obj.username), container_name
-    )
-    container_created = False
-
-    with gpu_manager.locked_allocation():
-        try:
-            selected_gpus: list[int] = []
-            if payload.num_gpus > 0:
-                statuses = gpu_manager.get_gpu_status(db)
-                idle_gpu_indices: list[int] = []
-                for status in statuses:
-                    if status.get("is_idle") is True:
-                        gpu_index = status.get("index")
-                        if isinstance(gpu_index, int):
-                            idle_gpu_indices.append(gpu_index)
-                if len(idle_gpu_indices) < payload.num_gpus:
-                    raise HTTPException(
-                        status_code=400, detail="Not enough idle GPUs are available."
-                    )
-
-                selected_gpus = idle_gpu_indices[: payload.num_gpus]
-                gpu_manager.allocate(
-                    current_user, selected_gpus, payload.memory_gb, cpu_cores, db
-                )
-
-            instance = Instance(
-                user_id=current_user.id,
-                container_name=container_name,
-                display_name=display_name,
-                gpu_indices=selected_gpus,
-                memory_gb=payload.memory_gb,
-                cpu_cores=cpu_cores,
-                image_name=resolved_image_ref,
-                base_image_name=resolved_image_ref,
-                runtime_image_name=resolved_image_ref,
-                snapshot_status="none",
-                status="error",
-                auto_stop_hours=auto_stop_hours,
-                expire_at=expire_at,
-            )
-            db.add(instance)
-            db.flush()
-
-            container_info = container_manager.create_container(
-                username=str(current_user_obj.username),
-                gpu_indices=selected_gpus,
-                memory_gb=payload.memory_gb,
-                cpu_cores=cpu_cores,
-                image_name=resolved_image_ref,
-                container_name=container_name,
-                workspace_dir=workspace_path,
-                authorized_keys=_get_user_authorized_keys(db, int(current_user_obj.id)),
-            )
-            container_created = True
-            instance_obj = cast(Any, instance)
-            instance_obj.container_id = str(container_info["container_id"])
-            instance_obj.ssh_port = int(container_info["ssh_port"])
-            instance_obj.ssh_password = str(container_info["ssh_password"])
-            instance_obj.status = "running"
-            _clear_instance_runtime_error(instance)
-            _add_gpu_allocations(db, int(instance.id), selected_gpus)
-            LOGGER.info(
-                "Created instance %s for user %s",
-                instance_obj.container_name,
-                current_user_obj.username,
-            )
-            db.commit()
-            db.refresh(instance)
-            return _serialize_instance(instance)
-        except HTTPException:
-            if container_created:
-                try:
-                    container_manager.remove_container(container_name)
-                except RuntimeError:
-                    pass
-            _cleanup_instance_storage_dirs(workspace_path)
-            db.rollback()
-            raise
-        except ValueError as exc:
-            if container_created:
-                try:
-                    container_manager.remove_container(container_name)
-                except RuntimeError:
-                    pass
-            _cleanup_instance_storage_dirs(workspace_path)
-            db.rollback()
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except RuntimeError as exc:
-            if container_created:
-                try:
-                    container_manager.remove_container(container_name)
-                except RuntimeError:
-                    pass
-            _cleanup_instance_storage_dirs(workspace_path)
-            db.rollback()
-            status_code = 503 if "Unable to connect to Docker" in str(exc) else 500
-            raise HTTPException(status_code=status_code, detail=str(exc)) from exc
-        except Exception as exc:
-            if container_created:
-                try:
-                    container_manager.remove_container(container_name)
-                except RuntimeError:
-                    pass
-            _cleanup_instance_storage_dirs(workspace_path)
-            db.rollback()
+def _allocate_remote_port(db: Session, preferred_port: int | None = None) -> int:
+    start, end = REMOTE_PORT_RANGE
+    used_ports = set(db.execute(select(SimpleTunnel.remote_port)).scalars().all())
+    if preferred_port is not None:
+        if preferred_port < start or preferred_port > end:
             raise HTTPException(
-                status_code=500, detail=f"Failed to create instance: {exc}"
-            ) from exc
+                status_code=400,
+                detail=f"Remote port must be inside {start}-{end}.",
+            )
+        if preferred_port in used_ports:
+            raise HTTPException(status_code=409, detail="Remote port is already allocated.")
+        return preferred_port
+
+    for port in range(start, end + 1):
+        if port not in used_ports:
+            return port
+    raise HTTPException(status_code=409, detail="No remote ports are available.")
 
 
-@app.delete("/api/instances/{instance_id}")
-def delete_instance(
-    instance_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, str]:
-    """Delete one of the current user's instances."""
-    instance = _get_instance_for_user(db, instance_id, current_user)
-    _ensure_instance_not_rebuilding(instance)
-    _delete_instance(db, instance)
-    return {"message": "Instance deleted."}
+def _safe_section_name(tunnel: SimpleTunnel) -> str:
+    raw = f"simple-{tunnel.id}-{tunnel.owner}-{tunnel.remote_port}"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-")
 
 
-@app.post("/api/instances/{instance_id}/stop")
-def stop_instance(
-    instance_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, str]:
-    """Stop a running instance owned by the current user."""
-    instance = _get_instance_for_user(db, instance_id, current_user)
-    _ensure_instance_not_rebuilding(instance)
-    instance_obj = cast(Any, instance)
-    try:
-        container_manager.stop_container(str(instance_obj.container_name))
-        gpu_manager.release(str(instance_obj.container_name), db)
-        instance_obj.status = "stopped"
-        instance_obj.stopped_at = datetime.utcnow()
-        _clear_instance_auto_stop(instance)
-        _clear_instance_runtime_error(instance)
-        db.commit()
-    except RuntimeError as exc:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return {"message": "Instance stopped."}
-
-
-@app.post("/api/instances/{instance_id}/restart")
-def restart_instance(
-    instance_id: int,
-    payload: InstanceRestartRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, str]:
-    """Restart an instance after validating or reassigning its GPU reservation."""
-    instance = _get_instance_for_user(db, instance_id, current_user)
-    _ensure_instance_not_rebuilding(instance)
-    instance_obj = cast(Any, instance)
-    auto_stop_hours = _resolve_auto_stop_hours(
-        payload.auto_stop_hours,
-        payload.expire_hours,
-        default=DEFAULT_AUTO_STOP_HOURS,
-    )
-
-    with gpu_manager.locked_allocation():
-        try:
-            current_gpu_indices = [
-                int(gpu_index) for gpu_index in list(instance_obj.gpu_indices)
+def _render_frpc_config(tunnels: list[SimpleTunnel]) -> str:
+    lines = [
+        "[common]",
+        f"server_addr = {FRP_SERVER_ADDR}",
+        f"server_port = {FRP_SERVER_PORT}",
+        f"token = {FRP_TOKEN}",
+        "",
+    ]
+    for tunnel in tunnels:
+        lines.extend(
+            [
+                f"[{_safe_section_name(tunnel)}]",
+                "type = tcp",
+                f"local_ip = {tunnel.local_host}",
+                f"local_port = {tunnel.local_port}",
+                f"remote_port = {tunnel.remote_port}",
+                "",
             ]
-            container_name = str(instance_obj.container_name)
-            if _instance_is_running(instance):
-                container_manager.restart_container(container_name)
-                instance_obj.status = "running"
-                instance_obj.stopped_at = None
-                _set_instance_auto_stop(instance, auto_stop_hours)
-                _clear_instance_runtime_error(instance)
-                db.commit()
-                return {"message": "Instance restarted."}
-
-            gpu_manager.release(container_name, db)
-            gpu_indices = _choose_instance_gpu_indices(
-                db,
-                instance,
-                len(current_gpu_indices),
-                insufficient_detail="Not enough available GPUs to restart this instance.",
-            )
-            if gpu_indices:
-                gpu_manager.allocate(
-                    current_user,
-                    gpu_indices,
-                    int(instance_obj.memory_gb),
-                    int(instance_obj.cpu_cores),
-                    db,
-                )
-            if gpu_indices != current_gpu_indices:
-                _restart_instance_with_reassigned_gpus(
-                    db,
-                    instance,
-                    current_user,
-                    gpu_indices,
-                )
-                _set_instance_auto_stop(instance, auto_stop_hours)
-                LOGGER.info(
-                    "Restarted instance %s for user %s with reassigned GPUs %s",
-                    container_name,
-                    cast(Any, current_user).username,
-                    gpu_indices,
-                )
-                _clear_instance_runtime_error(instance)
-                db.commit()
-                return {"message": "Instance restarted."}
-
-            for gpu_index in gpu_indices:
-                exists = (
-                    db.query(GPUAllocation)
-                    .filter(
-                        GPUAllocation.gpu_index == gpu_index,
-                        GPUAllocation.instance_id == instance_obj.id,
-                    )
-                    .first()
-                )
-                if not exists:
-                    db.add(
-                        GPUAllocation(gpu_index=gpu_index, instance_id=instance_obj.id)
-                    )
-            container_manager.restart_container(container_name)
-            instance_obj.status = "running"
-            instance_obj.stopped_at = None
-            _set_instance_auto_stop(instance, auto_stop_hours)
-            _clear_instance_runtime_error(instance)
-            db.commit()
-        except HTTPException:
-            db.rollback()
-            raise
-        except InstanceStateChangedError as exc:
-            db.commit()
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        except ValueError as exc:
-            db.rollback()
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except RuntimeError as exc:
-            db.rollback()
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return {"message": "Instance restarted."}
-
-
-@app.post("/api/instances/{instance_id}/renew")
-def renew_instance(
-    instance_id: int,
-    payload: InstanceRenewRequest,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    """Reset the active auto-stop timer for one running instance."""
-    instance = _get_instance_for_user(db, instance_id, current_user)
-    instance_obj = cast(Any, instance)
-    now = datetime.utcnow()
-    if not _instance_is_running(instance):
-        raise HTTPException(
-            status_code=400,
-            detail="Auto-stop timer can only be reset while the instance is running.",
         )
-
-    reset_hours = payload.reset_hours
-    if reset_hours is None and payload.extend_days is not None:
-        reset_hours = payload.extend_days * 24
-    auto_stop_hours = _resolve_auto_stop_hours(
-        reset_hours,
-        payload.auto_stop_hours,
-        payload.extend_hours,
-        default=DEFAULT_AUTO_STOP_HOURS,
-    )
-    _set_instance_auto_stop(instance, auto_stop_hours, now=now)
-    db.commit()
-    db.refresh(instance)
-    return {
-        "message": "Auto-stop timer reset.",
-        "instance": _serialize_instance(instance),
-    }
+    return "\n".join(lines).strip() + "\n"
 
 
-@app.post("/api/instances/{instance_id}/rebuild")
-def rebuild_instance(
-    instance_id: int,
-    payload: InstanceRebuildRequest,
-    background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    """Update memory in place or rebuild one instance after a GPU config change."""
-    if payload.num_gpus not in {0, 1, 2, 4, 8}:
-        raise HTTPException(
-            status_code=400,
-            detail="Supported GPU counts are 0, 1, 2, 4, or 8.",
-        )
-    if payload.memory_gb % 8 != 0:
-        raise HTTPException(
-            status_code=400,
-            detail="Memory must be allocated in 8 GB increments.",
-        )
-    if payload.memory_gb > MAX_INSTANCE_MEMORY_GB:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Memory cannot exceed {MAX_INSTANCE_MEMORY_GB} GB.",
-        )
-    if payload.memory_gb not in INSTANCE_MEMORY_OPTIONS_GB:
-        allowed = ", ".join(str(value) for value in INSTANCE_MEMORY_OPTIONS_GB)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Memory must be one of configured options: {allowed} GB.",
-        )
-    _enforce_cpu_only_min_memory(payload.num_gpus, payload.memory_gb)
-    _enforce_gpu_memory_limit(payload.num_gpus, payload.memory_gb)
-
-    instance = _get_instance_for_user(db, instance_id, current_user)
-    _ensure_instance_not_rebuilding(instance)
-    if instance_id in instance_jobs_in_progress:
-        raise HTTPException(
-            status_code=409,
-            detail="Instance lifecycle operation is already in progress.",
-        )
-    instance_obj = cast(Any, instance)
-    original_status = str(instance_obj.status)
-    original_stopped_at = instance_obj.stopped_at
-    current_user_obj = cast(Any, current_user)
-    current_gpu_count = len(list(instance_obj.gpu_indices))
-    current_memory_gb = int(instance_obj.memory_gb)
-    current_is_running = _instance_is_running(instance)
-    if payload.num_gpus == current_gpu_count and payload.memory_gb == current_memory_gb:
-        raise HTTPException(status_code=400, detail="Configuration is unchanged.")
-
-    db.refresh(current_user)
-    usage = _get_running_usage(current_user)
-    current_usage_gpu = current_gpu_count if current_is_running else 0
-    current_usage_memory = current_memory_gb if current_is_running else 0
-    target_running = current_is_running if payload.num_gpus == current_gpu_count else True
-    target_usage_gpu = payload.num_gpus if target_running else 0
-    target_usage_memory = payload.memory_gb if target_running else 0
-    projected_gpu_usage = usage["used_gpu"] - current_usage_gpu + target_usage_gpu
-    if projected_gpu_usage > int(current_user_obj.quota_gpu):
-        raise HTTPException(status_code=400, detail="GPU quota exceeded.")
-    projected_memory_usage = (
-        usage["used_memory_gb"] - current_usage_memory + target_usage_memory
-    )
-    if projected_memory_usage > int(current_user_obj.quota_memory_gb):
-        raise HTTPException(status_code=400, detail="Memory quota exceeded.")
-
-    node_running_memory_gb = _get_node_running_memory_gb(db)
-    projected_node_memory_gb = (
-        node_running_memory_gb - current_usage_memory + target_usage_memory
-    )
-    if (
-        projected_node_memory_gb > NODE_ALLOCATABLE_MEMORY_GB
-        and not _is_cpu_only_min_memory(payload.num_gpus, payload.memory_gb)
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Node allocatable memory exceeded after rebuild. "
-                f"Used {node_running_memory_gb} GB, projected {projected_node_memory_gb} GB, "
-                f"limit {NODE_ALLOCATABLE_MEMORY_GB} GB."
-            ),
-        )
-
-    instance_obj.status = "rebuilding"
-    instance_obj.stopped_at = original_stopped_at
-    instance_jobs_in_progress.add(instance_id)
-    db.commit()
-    db.refresh(instance)
-    background_tasks.add_task(
-        _run_rebuild_instance_job,
-        int(instance_id),
-        int(current_user_obj.id),
-        num_gpus=int(payload.num_gpus),
-        memory_gb=int(payload.memory_gb),
-        original_status=original_status,
-        original_stopped_at=original_stopped_at,
-        original_gpu_count=current_gpu_count,
-    )
-    LOGGER.info(
-        "Scheduled rebuild for instance %s user=%s target_gpus=%s memory=%sGB",
-        instance_obj.container_name,
-        current_user_obj.username,
-        payload.num_gpus,
-        payload.memory_gb,
-    )
-    return _serialize_instance(instance)
-
-
-@app.post("/api/instances/{instance_id}/repair")
-def repair_instance(
-    instance_id: int,
-    background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    """Repair one broken instance by recreating it from its base image and workspace."""
-    instance = _get_instance_for_user(db, instance_id, current_user)
-    _ensure_instance_not_rebuilding(instance)
-    if instance_id in instance_jobs_in_progress:
-        raise HTTPException(
-            status_code=409,
-            detail="Instance lifecycle operation is already in progress.",
-        )
-    instance_obj = cast(Any, instance)
-    if _instance_is_running(instance):
-        raise HTTPException(
-            status_code=400,
-            detail="Repair is only available when the instance is stopped or failed.",
-        )
-
-    original_status = str(instance_obj.status)
-    original_stopped_at = instance_obj.stopped_at
-    instance_obj.status = "rebuilding"
-    instance_obj.stopped_at = original_stopped_at
-    instance_jobs_in_progress.add(instance_id)
-    db.commit()
-    db.refresh(instance)
-    background_tasks.add_task(
-        _run_repair_instance_job,
-        int(instance_id),
-        int(cast(Any, current_user).id),
-        original_status=original_status,
-        original_stopped_at=original_stopped_at,
-    )
-    LOGGER.info(
-        "Scheduled repair for instance %s user=%s",
-        instance_obj.container_name,
-        cast(Any, current_user).username,
-    )
-    return _serialize_instance(instance)
-
-
-@app.get("/api/instances/{instance_id}/logs")
-def get_instance_logs(
-    instance_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-) -> dict[str, str]:
-    """Fetch recent logs for one of the user's containers."""
-    instance = _get_instance_for_user(db, instance_id, current_user)
-    instance_obj = cast(Any, instance)
+def _read_pid() -> int | None:
     try:
-        return {"logs": container_manager.get_logs(str(instance_obj.container_name))}
-    except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return int(FRPC_PID_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return None
 
 
-@app.get("/api/gpus/status")
-def gpu_status(
-    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
-) -> list[dict[str, Any]]:
-    """Return all GPU live status data."""
-    del current_user
-    return gpu_manager.get_gpu_status(db)
+def _process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
 
 
-@app.get("/api/quota/me")
-def my_quota(
-    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
-) -> dict[str, Any]:
-    """Return current user's quota limits and usage."""
-    user = (
-        db.query(User)
-        .options(joinedload(User.instances))
-        .filter(User.id == current_user.id)
-        .first()
-    )
-    if user is None:
-        raise HTTPException(status_code=404, detail="User not found.")
-    user_obj = cast(Any, user)
-    usage = _get_running_usage(user)
-    return {
-        **usage,
-        "quota_gpu": user_obj.quota_gpu,
-        "quota_memory_gb": user_obj.quota_memory_gb,
-        "quota_max_instances": user_obj.quota_max_instances,
-    }
+def _stop_frpc_process() -> None:
+    pid = _read_pid()
+    if pid is None:
+        FRPC_PID_FILE.unlink(missing_ok=True)
+        return
+    if not _process_exists(pid):
+        FRPC_PID_FILE.unlink(missing_ok=True)
+        return
+
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(20):
+        if not _process_exists(pid):
+            break
+        time.sleep(0.1)
+    if _process_exists(pid):
+        os.kill(pid, signal.SIGKILL)
+    FRPC_PID_FILE.unlink(missing_ok=True)
 
 
-@app.get("/api/admin/users")
-def admin_list_users(
-    admin_user: User = Depends(get_admin_user), db: Session = Depends(get_db)
-) -> list[dict[str, Any]]:
-    """Return all users and their quota usage for administrators."""
-    del admin_user
-    users = (
-        db.query(User)
-        .options(joinedload(User.instances))
-        .order_by(User.created_at.asc())
-        .all()
-    )
-    result: list[dict[str, Any]] = []
-    for user in users:
-        user_obj = cast(Any, user)
-        usage = _get_running_usage(user)
-        result.append(
-            {
-                "id": user_obj.id,
-                "username": user_obj.username,
-                "email": user_obj.email,
-                "is_admin": user_obj.is_admin,
-                "created_at": user_obj.created_at.isoformat(),
-                **usage,
-                "quota_gpu": user_obj.quota_gpu,
-                "quota_memory_gb": user_obj.quota_memory_gb,
-                "quota_max_instances": user_obj.quota_max_instances,
-            }
+def _resolve_frpc_binary() -> str | None:
+    if Path(FRP_CLIENT_BIN).is_absolute():
+        return FRP_CLIENT_BIN if Path(FRP_CLIENT_BIN).exists() else None
+    return shutil.which(FRP_CLIENT_BIN)
+
+
+def _tail_log(path: Path, limit: int = 4000) -> str:
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - limit))
+            return fh.read().decode(errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def sync_frpc_config(db: Session) -> tuple[str, str | None]:
+    """Render and restart the standalone FRP client process for all tunnels."""
+    tunnels = list(db.execute(select(SimpleTunnel).order_by(SimpleTunnel.id)).scalars().all())
+    FRPC_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    FRPC_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    FRPC_CONFIG_FILE.write_text(_render_frpc_config(tunnels), encoding="utf-8")
+
+    if not tunnels:
+        _stop_frpc_process()
+        return ("configured", None)
+
+    if not FRP_ENABLED:
+        message = "FRP is disabled; tunnel config was rendered only."
+        _set_tunnel_status(db, tunnels, "configured", message)
+        return ("configured", message)
+    if not FRP_TOKEN:
+        message = "FRP token is empty."
+        _set_tunnel_status(db, tunnels, "error", message)
+        return ("error", message)
+
+    frpc_binary = _resolve_frpc_binary()
+    if frpc_binary is None:
+        message = f"frpc binary was not found: {FRP_CLIENT_BIN}"
+        _set_tunnel_status(db, tunnels, "error", message)
+        return ("error", message)
+
+    _stop_frpc_process()
+    log_fh = FRPC_LOG_FILE.open("ab")
+    try:
+        process = subprocess.Popen(
+            [frpc_binary, "-c", str(FRPC_CONFIG_FILE)],
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
-    return result
+    finally:
+        log_fh.close()
+
+    FRPC_PID_FILE.write_text(str(process.pid), encoding="utf-8")
+    time.sleep(0.35)
+    if process.poll() is not None:
+        message = _tail_log(FRPC_LOG_FILE) or "frpc exited immediately."
+        _set_tunnel_status(db, tunnels, "error", message)
+        return ("error", message)
+
+    _set_tunnel_status(db, tunnels, "active", None)
+    return ("active", None)
 
 
-@app.put("/api/admin/users/{user_id}/quota")
-def admin_update_quota(
-    user_id: int,
-    payload: QuotaUpdateRequest,
-    admin_user: User = Depends(get_admin_user),
-    db: Session = Depends(get_db),
-) -> dict[str, str]:
-    """Update a user's resource quota."""
-    del admin_user
-    user = db.query(User).filter(User.id == user_id).first()
-    if user is None:
-        raise HTTPException(status_code=404, detail="User not found.")
-    user_obj = cast(Any, user)
-    user_obj.quota_gpu = payload.quota_gpu
-    user_obj.quota_memory_gb = payload.quota_memory_gb
-    user_obj.quota_max_instances = payload.quota_max_instances
-    db.commit()
-    return {"message": "Quota updated."}
-
-
-@app.get("/api/admin/instances")
-def admin_list_instances(
-    username: str | None = None,  # cluster_manager 适配：支持按用户名过滤实例
-    admin_user: User = Depends(get_admin_user),
-    db: Session = Depends(get_db),
-) -> list[dict[str, Any]]:
-    """Return all managed instances for administrators."""
-    del admin_user
-    # cluster_manager 适配：有 username 参数时只返回该用户的实例
-    query = db.query(Instance).options(joinedload(Instance.user))
-    if username:
-        user = db.query(User).filter(User.username == username).first()
-        if not user:
-            return []
-        query = query.filter(Instance.user_id == user.id)
-    instances = query.order_by(Instance.created_at.desc()).all()
-    return [_serialize_instance(instance) for instance in instances]
-
-
-@app.get("/api/admin/storage")
-def admin_storage_status(
-    admin_user: User = Depends(get_admin_user),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    """Return DATA_DIR and per-instance workspace mount diagnostics."""
-    del admin_user
-    instances = (
-        db.query(Instance)
-        .options(joinedload(Instance.user))
-        .order_by(Instance.created_at.desc())
-        .all()
-    )
-    mount_results: list[dict[str, Any]] = []
-    for instance in instances:
-        instance_obj = cast(Any, instance)
-        user_obj = cast(Any, instance_obj.user)
-        mount_info = container_manager.inspect_workspace_mount(
-            str(user_obj.username), str(instance_obj.container_name)
-        )
-        mount_info["instance_id"] = instance_obj.id
-        mount_info["username"] = user_obj.username
-        mount_info["status"] = instance_obj.status
-        mount_results.append(mount_info)
-    return {
-        "data_root": container_manager.get_data_root_status(),
-        "instances": mount_results,
-    }
-
-
-@app.post("/api/admin/instances/{instance_id}/remount-workspace")
-def admin_remount_instance_workspace(
-    instance_id: int,
-    background_tasks: BackgroundTasks,
-    admin_user: User = Depends(get_admin_user),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    """Schedule a stopped instance remount so Docker refreshes its workspace bind source."""
-    del admin_user
-    instance = (
-        db.query(Instance)
-        .options(joinedload(Instance.user))
-        .filter(Instance.id == instance_id)
-        .first()
-    )
-    if not instance:
-        raise HTTPException(status_code=404, detail="Instance not found.")
-
-    if instance_id in remount_jobs_in_progress:
-        raise HTTPException(
-            status_code=409,
-            detail="Workspace remount is already in progress.",
-        )
-
-    instance_obj = cast(Any, instance)
-    current_status = str(instance_obj.status)
-    if current_status == "rebuilding":
-        LOGGER.warning(
-            "Retrying workspace remount for instance %s currently marked rebuilding",
-            instance_obj.container_name,
-        )
-        original_status = "stopped"
-        original_stopped_at = instance_obj.stopped_at or datetime.utcnow()
-    else:
-        original_status = current_status
-        original_stopped_at = instance_obj.stopped_at
-
-    if _instance_is_running(instance):
-        raise HTTPException(
-            status_code=400,
-            detail="Stop the instance before remounting its workspace.",
-        )
-
-    instance_obj.status = "rebuilding"
-    instance_obj.stopped_at = original_stopped_at
-    remount_jobs_in_progress.add(instance_id)
-    db.commit()
-    db.refresh(instance)
-    background_tasks.add_task(
-        _run_remount_instance_workspace_job,
-        int(instance_id),
-        original_status,
-        original_stopped_at,
-    )
-    LOGGER.info(
-        "Scheduled workspace remount for instance %s by admin",
-        instance_obj.container_name,
-    )
-    return _serialize_instance(instance)
-
-
-@app.delete("/api/admin/instances/{instance_id}")
-def admin_delete_instance(
-    instance_id: int,
-    admin_user: User = Depends(get_admin_user),
-    db: Session = Depends(get_db),
-) -> dict[str, str]:
-    """Force delete any instance as an administrator."""
-    del admin_user
-    instance = (
-        db.query(Instance)
-        .options(joinedload(Instance.user))
-        .filter(Instance.id == instance_id)
-        .first()
-    )
-    if not instance:
-        raise HTTPException(status_code=404, detail="Instance not found.")
-    _ensure_instance_not_rebuilding(instance)
-    _delete_instance(db, instance)
-    return {"message": "Instance deleted."}
-
-
-# ---------------------------------------------------------------------------
-# FRP 相关 API — 供 VPS (Clustermanager) 使用
-# ---------------------------------------------------------------------------
-
-
-class FrpContainerInfo(BaseModel):
-    """容器 FRP 连接信息."""
-
-    container_name: str
-    ssh_port: int
-    secret_key: str
-
-
-def verify_internal_service_token(
-    x_internal_token: str | None = Header(default=None),
+def _set_tunnel_status(
+    db: Session,
+    tunnels: list[SimpleTunnel],
+    status: str,
+    error: str | None,
 ) -> None:
-    """Validate service-to-service requests from Clustermanager."""
-    expected_token = INTERNAL_SERVICE_TOKEN
-    if x_internal_token is None or x_internal_token != expected_token:
-        raise HTTPException(status_code=403, detail="Invalid internal service token")
+    now = datetime.utcnow()
+    for tunnel in tunnels:
+        tunnel.status = status
+        tunnel.error = error
+        tunnel.updated_at = now
+    db.commit()
 
 
-@app.post("/api/internal/users/sync")
-def sync_user_from_cluster(
-    payload: InternalUserSyncRequest,
-    _: None = Depends(verify_internal_service_token),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    """Idempotently create or refresh one node shadow user from central auth data."""
-    user = db.query(User).filter(User.username == payload.username).first()
-    created = False
-    synced_email = payload.email
-
-    existing_email_owner = (
-        db.query(User)
-        .filter(User.email == payload.email, User.username != payload.username)
-        .first()
-    )
-    if existing_email_owner is not None:
-        synced_email = f"{payload.username}@shadow.local"
-        LOGGER.warning(
-            "Remapped shadow email for user=%s because email=%s is already used by user=%s",
-            payload.username,
-            payload.email,
-            cast(Any, existing_email_owner).username,
-        )
-
-    if user is None:
-        user = User(
-            username=payload.username,
-            email=synced_email,
-            password_hash=build_shadow_password_hash(payload.username),
-            is_admin=payload.is_admin,
-        )
-        db.add(user)
-        created = True
-    else:
-        user_obj = cast(Any, user)
-        user_obj.is_admin = payload.is_admin
-        user_obj.email = synced_email
-
-    db.flush()
-    user_obj = cast(Any, user)
-    if payload.quota_gpu is not None:
-        user_obj.quota_gpu = payload.quota_gpu
-    if payload.quota_memory_gb is not None:
-        user_obj.quota_memory_gb = payload.quota_memory_gb
-    if payload.quota_max_instances is not None:
-        user_obj.quota_max_instances = payload.quota_max_instances
-    existing_keys = (
-        db.query(UserSSHKey)
-        .filter(UserSSHKey.user_id == int(user_obj.id))
-        .all()
-    )
-    existing_by_fingerprint = {
-        str(key.fingerprint): key
-        for key in existing_keys
-        if str(key.fingerprint or "").strip()
+def _serialize_tunnel(tunnel: SimpleTunnel) -> dict[str, Any]:
+    address = f"{PUBLIC_HOST}:{tunnel.remote_port}"
+    return {
+        "id": int(tunnel.id),
+        "owner": str(tunnel.owner),
+        "name": str(tunnel.name),
+        "protocol": str(tunnel.protocol),
+        "local_host": str(tunnel.local_host),
+        "local_port": int(tunnel.local_port),
+        "public_host": PUBLIC_HOST,
+        "remote_port": int(tunnel.remote_port),
+        "address": address,
+        "url": address,
+        "status": str(tunnel.status),
+        "error": tunnel.error,
+        "created_at": tunnel.created_at.isoformat(),
+        "updated_at": tunnel.updated_at.isoformat(),
     }
-    incoming_fingerprints: set[str] = set()
-    for key_payload in payload.ssh_public_keys:
-        fingerprint = str(key_payload.fingerprint)
-        incoming_fingerprints.add(fingerprint)
-        existing_key = existing_by_fingerprint.get(fingerprint)
-        if existing_key is None:
-            db.add(
-                UserSSHKey(
-                    user_id=int(user_obj.id),
-                    public_key=key_payload.public_key,
-                    remark=key_payload.remark,
-                    fingerprint=fingerprint,
-                )
-            )
-        else:
-            existing_key.public_key = key_payload.public_key
-            existing_key.remark = key_payload.remark
 
-    for fingerprint, existing_key in existing_by_fingerprint.items():
-        if fingerprint not in incoming_fingerprints:
-            db.delete(existing_key)
 
+def _visible_tunnels(db: Session, principal: Principal, include_all: bool = False) -> list[SimpleTunnel]:
+    statement = select(SimpleTunnel).order_by(SimpleTunnel.created_at.desc(), SimpleTunnel.id.desc())
+    if not (principal.is_admin and include_all):
+        statement = statement.where(SimpleTunnel.owner == principal.username)
+    return list(db.execute(statement).scalars().all())
+
+
+def _create_tunnel(
+    db: Session,
+    principal: Principal,
+    payload: TunnelCreateRequest,
+) -> SimpleTunnel:
+    _validate_tunnel_request(payload)
+    remote_port = _allocate_remote_port(db, payload.remote_port)
+    name = payload.name or f"port-{payload.local_port}"
+    tunnel = SimpleTunnel(
+        owner=principal.username,
+        name=name,
+        protocol="tcp",
+        local_host=payload.local_host,
+        local_port=payload.local_port,
+        remote_port=remote_port,
+        status="configured",
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    db.add(tunnel)
     try:
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Failed to sync user to node.") from exc
+        raise HTTPException(status_code=409, detail="Remote port is already allocated.") from exc
 
+    sync_frpc_config(db)
+    db.refresh(tunnel)
     LOGGER.info(
-        "Synced cluster user to node user=%s created=%s is_admin=%s ssh_keys=%s",
-        payload.username,
-        created,
-        payload.is_admin,
-        len(payload.ssh_public_keys),
+        "Created tunnel owner=%s local=%s:%s remote=%s",
+        principal.username,
+        payload.local_host,
+        payload.local_port,
+        remote_port,
     )
+    return tunnel
+
+
+def _delete_tunnel(db: Session, principal: Principal, tunnel_id: int) -> None:
+    tunnel = db.get(SimpleTunnel, tunnel_id)
+    if tunnel is None:
+        raise HTTPException(status_code=404, detail="Tunnel not found.")
+    if tunnel.owner != principal.username and not principal.is_admin:
+        raise HTTPException(status_code=403, detail="Tunnel belongs to another user.")
+
+    db.delete(tunnel)
+    db.commit()
+    sync_frpc_config(db)
+    LOGGER.info("Deleted tunnel id=%s owner=%s by=%s", tunnel_id, tunnel.owner, principal.username)
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    del application
+    init_db()
+    db = SessionLocal()
+    try:
+        sync_frpc_config(db)
+    except Exception as exc:
+        LOGGER.warning("Failed to sync simple FRP config on startup: %s", exc)
+    finally:
+        db.close()
+    try:
+        yield
+    finally:
+        if STOP_TUNNELS_ON_EXIT:
+            _stop_frpc_process()
+
+
+app = FastAPI(title="Simple Server Manager", version="0.1.0", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/")
+def root() -> dict[str, str]:
     return {
-        "success": True,
-        "created": created,
-        "username": payload.username,
-        "ssh_key_count": len(payload.ssh_public_keys),
+        "name": "Simple Servermanager",
+        "mode": "tunnel-only",
+        "docs": "/docs",
     }
 
 
-@app.delete("/api/internal/users/{username}")
-def delete_user_from_cluster(
+@app.get("/api/health")
+def health() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "mode": "tunnel-only",
+        "frp_enabled": FRP_ENABLED,
+        "public_host": PUBLIC_HOST,
+        "remote_port_range": {
+            "start": REMOTE_PORT_RANGE[0],
+            "end": REMOTE_PORT_RANGE[1],
+        },
+    }
+
+
+@app.post("/api/login")
+def login(payload: LoginRequest) -> dict[str, Any]:
+    principal = authenticate_local_user(payload.username, payload.password)
+    return {
+        "access_token": create_access_token(principal),
+        "token_type": "bearer",
+        "user": {
+            "username": principal.username,
+            "is_admin": principal.is_admin,
+        },
+    }
+
+
+@app.get("/api/auth/me")
+def me(principal: Principal = Depends(get_current_principal)) -> dict[str, Any]:
+    return {"username": principal.username, "is_admin": principal.is_admin}
+
+
+@app.get("/api/tunnels")
+def list_tunnels(
+    include_all: bool = Query(default=False),
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    tunnels = _visible_tunnels(db, principal, include_all=include_all)
+    return {"tunnels": [_serialize_tunnel(tunnel) for tunnel in tunnels]}
+
+
+@app.post("/api/tunnels")
+def create_tunnel(
+    payload: TunnelCreateRequest,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    tunnel = _create_tunnel(db, principal, payload)
+    return {"tunnel": _serialize_tunnel(tunnel)}
+
+
+@app.delete("/api/tunnels/{tunnel_id}")
+def delete_tunnel(
+    tunnel_id: int,
+    principal: Principal = Depends(get_current_principal),
+    db: Session = Depends(get_db),
+) -> dict[str, bool]:
+    _delete_tunnel(db, principal, tunnel_id)
+    return {"deleted": True}
+
+
+@app.get("/api/internal/users/{username}")
+def internal_user_exists(
     username: str,
-    _: None = Depends(verify_internal_service_token),
-    db: Session = Depends(get_db),
+    _: Principal = Depends(_require_internal_principal),
 ) -> dict[str, Any]:
-    """Delete one node shadow user when the central account has been removed."""
-    if username == ADMIN_USERNAME:
-        raise HTTPException(status_code=400, detail="Cannot delete reserved admin user.")
-
-    user = db.query(User).filter(User.username == username).first()
-    if user is None:
-        return {"success": True, "deleted": False, "username": username}
-
-    user_obj = cast(Any, user)
-    if bool(user_obj.is_admin):
-        raise HTTPException(status_code=400, detail="Cannot delete admin user.")
-
-    instance_count = db.query(Instance).filter(Instance.user_id == int(user_obj.id)).count()
-    if instance_count > 0:
-        raise HTTPException(
-            status_code=409,
-            detail="User still has instances on this node.",
-        )
-
-    db.delete(user)
-    db.commit()
-    LOGGER.info("Deleted node shadow user user=%s", username)
-    return {"success": True, "deleted": True, "username": username}
-
-
-@app.get("/api/frp/containers")
-def list_frp_containers(
-    _: None = Depends(verify_internal_service_token),
-) -> list[FrpContainerInfo]:
-    """返回所有容器的 FRP 连接信息（供 VPS visitor 使用）."""
-    from frp_manager import FrpManager
-
-    frp = FrpManager()
-    containers = frp.get_ready_containers()
-
-    result = []
-    for c in containers:
-        result.append(
-            FrpContainerInfo(
-                container_name=c["name"],
-                ssh_port=c["ssh_port"],
-                secret_key=frp.get_container_secret(c["name"]),
-            )
-        )
-    return result
-
-
-@app.get("/api/frp/containers/{container_name}")
-def get_frp_container_info(
-    container_name: str,
-    _: None = Depends(verify_internal_service_token),
-) -> FrpContainerInfo:
-    """返回单个容器的 FRP 连接信息."""
-    from frp_manager import FrpManager
-
-    frp = FrpManager()
-    containers = frp.get_ready_containers()
-
-    for c in containers:
-        if c["name"] == container_name:
-            return FrpContainerInfo(
-                container_name=c["name"],
-                ssh_port=c["ssh_port"],
-                secret_key=frp.get_container_secret(c["name"]),
-            )
-
-    raise HTTPException(status_code=404, detail="Container not found in FRP config.")
-
-
-@app.post("/api/frp/sync")
-def sync_frp_config(
-    _: None = Depends(verify_internal_service_token),
-) -> dict[str, Any]:
-    """手动触发 FRP 配置同步."""
-    success = container_manager.sync_frp_config()
-    return {"success": success, "message": "FRP config synced" if success else "Failed"}
-
-
-class VpsAccessInfo(BaseModel):
-    """VPS 访问信息模型."""
-
-    vps_port: int
-    vps_ip: str
-    ssh_cmd: str
-
-
-@app.post("/api/instances/{container_name}/vps-access")
-def update_vps_access(
-    container_name: str,
-    vps_info: VpsAccessInfo,
-    _: None = Depends(verify_internal_service_token),
-    db: Session = Depends(get_db),
-) -> dict[str, Any]:
-    """更新实例的 VPS 访问信息（由 ClusterManager 调用）."""
-
-    instance = (
-        db.query(Instance).filter(Instance.container_name == container_name).first()
-    )
-
-    if not instance:
-        raise HTTPException(status_code=404, detail="Instance not found")
-
-    # 存储 VPS 访问信息
-    instance_obj = cast(Any, instance)
-    instance_obj.vps_access = {
-        "vps_port": vps_info.vps_port,
-        "vps_ip": vps_info.vps_ip,
-        "ssh_cmd": vps_info.ssh_cmd,
-    }
-    db.commit()
-
+    allowed = is_local_user_allowed(username)
     return {
-        "success": True,
-        "message": "VPS access info updated",
-        "container_name": container_name,
-        "vps_access": instance_obj.vps_access,
+        "username": username,
+        "exists": allowed,
+        "is_admin": is_admin_username(username) if allowed else False,
     }
 
 
-@app.get("/api/instances/{container_name}/vps-access")
-def get_vps_access(
-    container_name: str,
-    current_user: User = Depends(get_current_user),
+@app.get("/api/internal/tunnels")
+def internal_list_tunnels(
+    include_all: bool = Query(default=False),
+    principal: Principal = Depends(_require_internal_principal),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    """获取实例的 VPS 访问信息."""
-    instance = (
-        db.query(Instance).filter(Instance.container_name == container_name).first()
-    )
+    tunnels = _visible_tunnels(db, principal, include_all=include_all)
+    return {"tunnels": [_serialize_tunnel(tunnel) for tunnel in tunnels]}
 
-    if not instance:
-        raise HTTPException(status_code=404, detail="Instance not found")
 
-    # 检查权限（管理员或实例所有者）
-    current_user_obj = cast(Any, current_user)
-    instance_obj = cast(Any, instance)
-    if not current_user_obj.is_admin and instance_obj.user_id != current_user_obj.id:
-        raise HTTPException(status_code=403, detail="Permission denied")
+@app.post("/api/internal/tunnels")
+def internal_create_tunnel(
+    payload: TunnelCreateRequest,
+    principal: Principal = Depends(_require_internal_principal),
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    tunnel = _create_tunnel(db, principal, payload)
+    return {"tunnel": _serialize_tunnel(tunnel)}
 
-    if not instance_obj.vps_access:
-        return {"success": False, "message": "VPS access info not available"}
 
-    return {"success": True, "vps_access": instance_obj.vps_access}
+@app.delete("/api/internal/tunnels/{tunnel_id}")
+def internal_delete_tunnel(
+    tunnel_id: int,
+    principal: Principal = Depends(_require_internal_principal),
+    db: Session = Depends(get_db),
+) -> dict[str, bool]:
+    _delete_tunnel(db, principal, tunnel_id)
+    return {"deleted": True}

@@ -1,5 +1,5 @@
 [Unit]
-Description=FRP Client for Servermanager API
+Description=FRP Client for Simple Servermanager API
 After=network.target
 
 [Service]
@@ -7,7 +7,7 @@ Type=simple
 User=root
 Restart=always
 RestartSec=5
-ExecStart=/usr/local/bin/frpc -c /etc/frp/frpc-api.ini
+ExecStart=/usr/local/bin/frpc -c /etc/frp/simple-frpc-api.ini
 ExecReload=/bin/kill -HUP $MAINPID
 
 [Install]

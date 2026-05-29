@@ -1,5 +1,5 @@
 #!/bin/bash
-# FRP 安装脚本 — Servermanager 端
+# FRP install helper for the simplified Servermanager node.
 
 set -e
 
@@ -24,40 +24,17 @@ tar -xzf "frp_${FRP_VERSION}_${FRP_ARCH}.tar.gz"
 install_binary_safe "frp_${FRP_VERSION}_${FRP_ARCH}/frpc" "/usr/local/bin/frpc"
 rm -rf "frp_${FRP_VERSION}_${FRP_ARCH}"
 
-# 创建配置目录
 sudo mkdir -p /etc/frp
-sudo mkdir -p /etc/frp/containers
-
-# 安装 systemd 服务（per-container 模式）
-sudo cp "${SCRIPT_DIR}/frpc-container@.service" /etc/systemd/system/
-sudo cp "${SCRIPT_DIR}/frpc-api.service" /etc/systemd/system/
-
-# 清理旧聚合模式服务，避免新部署或升级后误启
-if sudo test -f /etc/systemd/system/frpc-containers.service; then
-  sudo systemctl stop frpc-containers.service 2>/dev/null || true
-  sudo systemctl disable frpc-containers.service 2>/dev/null || true
-  sudo rm -f /etc/systemd/system/frpc-containers.service
-fi
-
-# 重新加载 systemd
-sudo systemctl daemon-reload
 
 echo "=== FRP installed successfully ==="
 echo ""
 echo "Next steps:"
-echo "1. Configure FRP_* variables in Servermanager/.env"
-echo "   (FRP_SERVER_ADDR / FRP_SERVER_PORT / FRP_TOKEN)"
+echo "1. Configure SIMPLE_FRP_* variables in Servermanager/.env"
+echo "   (SIMPLE_FRP_SERVER_ADDR / SIMPLE_FRP_SERVER_PORT / SIMPLE_FRP_TOKEN)"
 echo ""
-echo "2. Start the services:"
-echo "   sudo systemctl enable frpc-api"
-echo "   sudo systemctl start frpc-api"
+echo "2. Configure the node API tunnel if the node is behind NAT:"
+echo "   SIMPLE_API_FRP_ENABLED=true"
+echo "   SIMPLE_API_REMOTE_PORT=18881"
 echo ""
-echo "3. Container SSH tunnels now run in per-instance mode via"
-echo "   frpc-container@<container>.service, managed automatically by Servermanager."
-echo "   Legacy frpc-containers aggregate mode has been retired and will be cleaned up."
-echo ""
-echo "4. Starting Servermanager will now sync /etc/frp/frpc-api.ini from .env"
-echo "   and restart frpc-api automatically when the token/port changes."
-echo ""
-echo "5. Start Servermanager:"
+echo "3. Start simplified Servermanager:"
 echo "   ./start.sh"
