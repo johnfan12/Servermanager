@@ -106,6 +106,8 @@ FRPC_LOG_FILE = Path(
 REMOTE_PORT_RANGE_RAW = os.environ.get("SIMPLE_TUNNEL_REMOTE_PORT_RANGE", "30000-39999")
 SSH_LOCAL_HOST = os.environ.get("SIMPLE_SSH_LOCAL_HOST", "127.0.0.1")
 SSH_LOCAL_PORT = int(os.environ.get("SIMPLE_SSH_LOCAL_PORT", "22"))
+SSH_TUNNEL_ENABLED = os.environ.get("SIMPLE_SSH_TUNNEL_ENABLED", "true").lower() == "true"
+SSH_PROXY_NAME = os.environ.get("SIMPLE_SSH_PROXY_NAME", "simple-node-ssh")
 ALLOW_CUSTOM_TUNNELS = os.environ.get("SIMPLE_ALLOW_CUSTOM_TUNNELS", "false").lower() == "true"
 ALLOW_NON_LOOPBACK = os.environ.get("SIMPLE_ALLOW_NON_LOOPBACK", "false").lower() == "true"
 REQUIRE_LISTENING_LOCAL_PORT = (
@@ -184,6 +186,7 @@ def _parse_port_range(raw: str) -> tuple[int, int]:
 
 
 REMOTE_PORT_RANGE = _parse_port_range(REMOTE_PORT_RANGE_RAW)
+SSH_REMOTE_PORT = int(os.environ.get("SIMPLE_SSH_REMOTE_PORT", str(REMOTE_PORT_RANGE[0])))
 
 
 def init_db() -> None:
@@ -300,6 +303,23 @@ def _render_frpc_config(tunnels: list[SimpleTunnel]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def _render_fixed_ssh_frpc_config() -> str:
+    lines = [
+        "[common]",
+        f"server_addr = {FRP_SERVER_ADDR}",
+        f"server_port = {FRP_SERVER_PORT}",
+        f"token = {FRP_TOKEN}",
+        "",
+        f"[{SSH_PROXY_NAME}]",
+        "type = tcp",
+        f"local_ip = {SSH_LOCAL_HOST}",
+        f"local_port = {SSH_LOCAL_PORT}",
+        f"remote_port = {SSH_REMOTE_PORT}",
+        "",
+    ]
+    return "\n".join(lines).strip() + "\n"
+
+
 def _read_pid() -> int | None:
     try:
         return int(FRPC_PID_FILE.read_text().strip())
@@ -315,22 +335,63 @@ def _process_exists(pid: int) -> bool:
         return False
 
 
+def _frpc_config_pids() -> set[int]:
+    config_path = str(FRPC_CONFIG_FILE)
+    try:
+        result = subprocess.run(
+            ["ps", "-eo", "pid=,args="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return set()
+
+    pids: set[int] = set()
+    current_pid = os.getpid()
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        pid_text, _, args = stripped.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        if "frpc" in args and config_path in args:
+            pids.add(pid)
+    return pids
+
+
 def _stop_frpc_process() -> None:
+    pids: set[int] = set()
     pid = _read_pid()
-    if pid is None:
-        FRPC_PID_FILE.unlink(missing_ok=True)
-        return
-    if not _process_exists(pid):
+    if pid is not None:
+        pids.add(pid)
+    pids.update(_frpc_config_pids())
+
+    live_pids = {pid for pid in pids if _process_exists(pid)}
+    if not live_pids:
         FRPC_PID_FILE.unlink(missing_ok=True)
         return
 
-    os.kill(pid, signal.SIGTERM)
+    for pid in live_pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
     for _ in range(20):
-        if not _process_exists(pid):
+        live_pids = {pid for pid in live_pids if _process_exists(pid)}
+        if not live_pids:
             break
         time.sleep(0.1)
-    if _process_exists(pid):
-        os.kill(pid, signal.SIGKILL)
+    for pid in live_pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
     FRPC_PID_FILE.unlink(missing_ok=True)
 
 
@@ -400,6 +461,49 @@ def sync_frpc_config(db: Session) -> tuple[str, str | None]:
     return ("active", None)
 
 
+def sync_fixed_ssh_frpc_config() -> tuple[str, str | None]:
+    """Render and restart the fixed per-node SSH FRP client."""
+    FRPC_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    FRPC_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    if not SSH_TUNNEL_ENABLED:
+        FRPC_CONFIG_FILE.write_text(
+            _render_frpc_config([]),
+            encoding="utf-8",
+        )
+        _stop_frpc_process()
+        return ("disabled", None)
+
+    FRPC_CONFIG_FILE.write_text(_render_fixed_ssh_frpc_config(), encoding="utf-8")
+
+    if not FRP_ENABLED:
+        return ("configured", "FRP is disabled; fixed SSH config was rendered only.")
+    if not FRP_TOKEN:
+        return ("error", "FRP token is empty.")
+
+    frpc_binary = _resolve_frpc_binary()
+    if frpc_binary is None:
+        return ("error", f"frpc binary was not found: {FRP_CLIENT_BIN}")
+
+    _stop_frpc_process()
+    log_fh = FRPC_LOG_FILE.open("ab")
+    try:
+        process = subprocess.Popen(
+            [frpc_binary, "-c", str(FRPC_CONFIG_FILE)],
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        log_fh.close()
+
+    FRPC_PID_FILE.write_text(str(process.pid), encoding="utf-8")
+    time.sleep(0.35)
+    if process.poll() is not None:
+        return ("error", _tail_log(FRPC_LOG_FILE) or "frpc exited immediately.")
+    return ("active", None)
+
+
 def _set_tunnel_status(
     db: Session,
     tunnels: list[SimpleTunnel],
@@ -434,6 +538,28 @@ def _serialize_tunnel(tunnel: SimpleTunnel) -> dict[str, Any]:
         "error": tunnel.error,
         "created_at": tunnel.created_at.isoformat(),
         "updated_at": tunnel.updated_at.isoformat(),
+    }
+
+
+def _serialize_fixed_ssh_access(principal: Principal, status: str = "active", error: str | None = None) -> dict[str, Any]:
+    address = f"{PUBLIC_HOST}:{SSH_REMOTE_PORT}"
+    ssh_command = f"ssh -p {SSH_REMOTE_PORT} {principal.username}@{PUBLIC_HOST}"
+    return {
+        "id": f"fixed-{SSH_REMOTE_PORT}",
+        "owner": principal.username,
+        "name": "ssh",
+        "protocol": "tcp",
+        "target": "ssh",
+        "local_host": SSH_LOCAL_HOST,
+        "local_port": SSH_LOCAL_PORT,
+        "public_host": PUBLIC_HOST,
+        "remote_port": SSH_REMOTE_PORT,
+        "address": address,
+        "url": address,
+        "ssh_command": ssh_command,
+        "status": status,
+        "error": error,
+        "fixed": True,
     }
 
 
@@ -499,13 +625,12 @@ def _delete_tunnel(db: Session, principal: Principal, tunnel_id: int) -> None:
 async def lifespan(application: FastAPI):
     del application
     init_db()
-    db = SessionLocal()
     try:
-        sync_frpc_config(db)
+        status, error = sync_fixed_ssh_frpc_config()
+        if error:
+            LOGGER.warning("Fixed SSH FRP sync ended with status=%s error=%s", status, error)
     except Exception as exc:
-        LOGGER.warning("Failed to sync simple FRP config on startup: %s", exc)
-    finally:
-        db.close()
+        LOGGER.warning("Failed to sync fixed SSH FRP config on startup: %s", exc)
     try:
         yield
     finally:
@@ -534,11 +659,19 @@ def root() -> dict[str, str]:
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
+    fixed_status = "active" if _read_pid() is not None or _frpc_config_pids() else "stopped"
     return {
         "ok": True,
-        "mode": "tunnel-only",
+        "mode": "fixed-ssh",
         "frp_enabled": FRP_ENABLED,
         "public_host": PUBLIC_HOST,
+        "ssh": {
+            "enabled": SSH_TUNNEL_ENABLED,
+            "status": fixed_status,
+            "local_host": SSH_LOCAL_HOST,
+            "local_port": SSH_LOCAL_PORT,
+            "remote_port": SSH_REMOTE_PORT,
+        },
         "remote_port_range": {
             "start": REMOTE_PORT_RANGE[0],
             "end": REMOTE_PORT_RANGE[1],
@@ -570,8 +703,8 @@ def list_tunnels(
     principal: Principal = Depends(get_current_principal),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    tunnels = _visible_tunnels(db, principal, include_all=include_all)
-    return {"tunnels": [_serialize_tunnel(tunnel) for tunnel in tunnels]}
+    del include_all, db
+    return {"tunnels": [_serialize_fixed_ssh_access(principal)]}
 
 
 @app.post("/api/tunnels")
@@ -580,8 +713,8 @@ def create_tunnel(
     principal: Principal = Depends(get_current_principal),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    tunnel = _create_tunnel(db, principal, payload)
-    return {"tunnel": _serialize_tunnel(tunnel)}
+    del payload, db
+    return {"tunnel": _serialize_fixed_ssh_access(principal)}
 
 
 @app.delete("/api/tunnels/{tunnel_id}")
@@ -590,7 +723,7 @@ def delete_tunnel(
     principal: Principal = Depends(get_current_principal),
     db: Session = Depends(get_db),
 ) -> dict[str, bool]:
-    _delete_tunnel(db, principal, tunnel_id)
+    del tunnel_id, principal, db
     return {"deleted": True}
 
 
@@ -613,8 +746,8 @@ def internal_list_tunnels(
     principal: Principal = Depends(_require_internal_principal),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    tunnels = _visible_tunnels(db, principal, include_all=include_all)
-    return {"tunnels": [_serialize_tunnel(tunnel) for tunnel in tunnels]}
+    del include_all, db
+    return {"tunnels": [_serialize_fixed_ssh_access(principal)]}
 
 
 @app.post("/api/internal/tunnels")
@@ -623,8 +756,8 @@ def internal_create_tunnel(
     principal: Principal = Depends(_require_internal_principal),
     db: Session = Depends(get_db),
 ) -> dict[str, Any]:
-    tunnel = _create_tunnel(db, principal, payload)
-    return {"tunnel": _serialize_tunnel(tunnel)}
+    del payload, db
+    return {"tunnel": _serialize_fixed_ssh_access(principal)}
 
 
 @app.delete("/api/internal/tunnels/{tunnel_id}")
@@ -633,5 +766,15 @@ def internal_delete_tunnel(
     principal: Principal = Depends(_require_internal_principal),
     db: Session = Depends(get_db),
 ) -> dict[str, bool]:
-    _delete_tunnel(db, principal, tunnel_id)
+    del tunnel_id, principal, db
     return {"deleted": True}
+
+
+@app.get("/api/ssh-access")
+def ssh_access(principal: Principal = Depends(get_current_principal)) -> dict[str, Any]:
+    return {"access": _serialize_fixed_ssh_access(principal)}
+
+
+@app.get("/api/internal/ssh-access")
+def internal_ssh_access(principal: Principal = Depends(_require_internal_principal)) -> dict[str, Any]:
+    return {"access": _serialize_fixed_ssh_access(principal)}

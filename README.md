@@ -5,8 +5,8 @@
 ## 能力范围
 
 - 使用本机 Linux 账号通过 PAM 登录。
-- 用户创建 SSH 隧道，把节点本机 SSH 入口暴露到 VPS/frps。
-- 返回 SSH 命令，例如 `ssh -p 30001 user@vps.example.com`。
+- 节点固定暴露一个 SSH 公网端口到 VPS/frps。
+- 返回 SSH 命令，例如 `ssh -p 30000 user@vps.example.com`。
 - 管理员账号可查看和删除所有隧道。
 - 独立使用 `simple_servermanager.db`、`runtime/simple-frpc-tunnels.ini` 和 `logs/simple-*.log`。
 
@@ -36,10 +36,10 @@ SIMPLE_FRP_CLIENT_BIN=/usr/local/bin/frpc
 SIMPLE_API_FRP_ENABLED=true
 SIMPLE_API_REMOTE_PORT=18881
 
-SIMPLE_TUNNEL_REMOTE_PORT_RANGE=30000-39999
+SIMPLE_SSH_TUNNEL_ENABLED=true
+SIMPLE_SSH_REMOTE_PORT=30000
 SIMPLE_SSH_LOCAL_HOST=127.0.0.1
 SIMPLE_SSH_LOCAL_PORT=22
-SIMPLE_ALLOW_CUSTOM_TUNNELS=false
 SIMPLE_ALLOW_NON_LOOPBACK=false
 SIMPLE_ADMIN_USERS=admin
 SIMPLE_ALLOWED_GROUPS=
@@ -65,10 +65,10 @@ PAM 依赖可用 `pip install python-pam` 安装；部分系统也可以使用�
 - `POST /api/login`
 - `GET /api/auth/me`
 - `GET /api/tunnels`
-- `POST /api/tunnels`
-- `DELETE /api/tunnels/{id}`
+- `GET /api/ssh-access`
 - `GET /api/internal/tunnels`
-- `POST /api/internal/tunnels`
-- `DELETE /api/internal/tunnels/{id}`
+- `GET /api/internal/ssh-access`
 
 `/api/internal/*` 由 Clustermanager 调用，需要 `X-Internal-Token`、`X-User` 和 `X-User-Is-Admin` 请求头。
+
+旧的 `POST/DELETE /api/*/tunnels` 会保留兼容返回，但固定端口模式下不再创建或删除用户级 FRP 进程。
