@@ -17,15 +17,19 @@ from typing import Any
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 from auth import (
     Principal,
+    _resolve_secret,
     authenticate_local_user,
     create_access_token,
     get_current_principal,
@@ -87,8 +91,9 @@ def _env_int(name: str, default: int = 0) -> int:
         return default
 
 
-INTERNAL_SERVICE_TOKEN = os.environ.get("SIMPLE_INTERNAL_SERVICE_TOKEN") or os.environ.get(
-    "INTERNAL_SERVICE_TOKEN", "change-this-internal-service-token"
+INTERNAL_SERVICE_TOKEN = _resolve_secret(
+    ["SIMPLE_INTERNAL_SERVICE_TOKEN", "INTERNAL_SERVICE_TOKEN"],
+    "INTERNAL_SERVICE_TOKEN",
 )
 PUBLIC_HOST = _normalize_public_host(
     os.environ.get("SIMPLE_PUBLIC_HOST")
@@ -215,14 +220,13 @@ def get_db() -> Any:
 def _require_internal_principal(
     x_internal_token: str | None = Header(default=None, alias="X-Internal-Token"),
     x_user: str | None = Header(default=None, alias="X-User"),
-    x_user_is_admin: str = Header(default="false", alias="X-User-Is-Admin"),
 ) -> Principal:
     verify_internal_token(x_internal_token, INTERNAL_SERVICE_TOKEN)
     username = str(x_user or "").strip()
     if not username or not is_local_user_allowed(username):
         raise HTTPException(status_code=403, detail="User is not a local account on this node.")
-    is_admin = x_user_is_admin.lower() in {"1", "true", "yes", "on"} or is_admin_username(username)
-    return Principal(username=username, is_admin=is_admin)
+    # Admin status determined solely by node-local system groups, not upstream headers.
+    return Principal(username=username, is_admin=is_admin_username(username))
 
 
 def _require_internal_token(
@@ -774,15 +778,41 @@ async def lifespan(application: FastAPI):
         if STOP_TUNNELS_ON_EXIT:
             _stop_frpc_process()
 
-
+limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="Simple Server Manager", version="0.1.0", lifespan=lifespan)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOW_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Requested-With", "X-Internal-Token", "X-User", "X-User-Is-Admin"],
 )
+
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+
+
+class CSRFHeaderMiddleware(BaseHTTPMiddleware):
+    """Require X-Requested-With on state-changing requests as CSRF defense."""
+
+    _UNSAFE_METHODS = {"POST", "PUT", "DELETE", "PATCH"}
+
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        if request.method in self._UNSAFE_METHODS:
+            # Internal service requests use X-Internal-Token — skip CSRF check.
+            if not request.headers.get("x-internal-token"):
+                if not request.headers.get("x-requested-with"):
+                    return JSONResponse(
+                        status_code=403,
+                        content={"detail": "Missing X-Requested-With header."},
+                    )
+        return await call_next(request)
+
+
+app.add_middleware(CSRFHeaderMiddleware)
 
 
 @app.get("/")
@@ -817,7 +847,8 @@ def health() -> dict[str, Any]:
 
 
 @app.post("/api/login")
-def login(payload: LoginRequest) -> dict[str, Any]:
+@limiter.limit("5/minute")
+def login(request: Request, payload: LoginRequest) -> dict[str, Any]:
     principal = authenticate_local_user(payload.username, payload.password)
     return {
         "access_token": create_access_token(principal),
